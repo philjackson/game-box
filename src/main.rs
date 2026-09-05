@@ -61,10 +61,10 @@ fn main() -> Result<()> {
     }
 
     let mut app = App::new()?;
-    // `gbox add <path>` drops straight into the wizard.
-    if args.first().map(String::as_str) == Some("add") {
+    // `gbox add <dir>` and `gbox install <exe>` drop straight into the wizard.
+    if let Some(cmd @ ("add" | "install")) = args.first().map(String::as_str) {
         let path = args.get(1).cloned().unwrap_or_default();
-        app.on_command(&format!("add {}", path));
+        app.on_command(&format!("{} {}", cmd, path));
     }
 
     let mut terminal = ratatui::init();
@@ -79,6 +79,7 @@ fn print_usage() {
          usage:\n  \
            gbox                 launch the TUI\n  \
            gbox add [path]      launch and open the add-a-game wizard\n  \
+           gbox install [exe]   launch and open the installer wizard\n  \
            gbox --runners       list detected wine/proton installations\n  \
            gbox --scan <dir>    show the executables the wizard would offer\n  \
            gbox --version\n",

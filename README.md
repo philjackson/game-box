@@ -6,6 +6,7 @@ status line, `:` commands — with btop-flavoured meters.
 ```
 gbox                 launch the TUI
 gbox add [path]      launch straight into the add-a-game wizard
+gbox install [exe]   launch straight into the installer wizard
 gbox --runners       list detected wine/proton installations
 gbox --scan <dir>    show the executables the wizard would offer, with scores
 ```
