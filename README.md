@@ -101,3 +101,7 @@ on `$PATH`.
 cargo build --release   # target/release/gbox
 cargo test
 ```
+
+## Licence
+
+GPL-3.0-or-later. See [LICENSE](LICENSE).
