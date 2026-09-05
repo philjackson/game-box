@@ -279,13 +279,20 @@ impl Worker {
         // Non-fatal: several proton builds bootstrap the prefix on their first
         // real run anyway, so a failure here is a warning, not the end.
         self.set(Phase::Booting);
-        // Wine's mono/gecko prompts are modal: without these overrides
-        // `wineboot` sits forever behind a dialog the user may not even see.
         let (boot_bin, boot_args) = match self.runner.kind {
             RunnerKind::Proton => (self.runner.bin.clone(), vec!["run".into(), "wineboot".into(), "-u".into()]),
             RunnerKind::Wine => (self.runner.bin.clone(), vec!["wineboot".into(), "--init".into()]),
         };
-        match self.spawn_and_wait_with(&boot_bin, &boot_args, &[("WINEDLLOVERRIDES", "mscoree,mshtml=d")], None) {
+        // Plain wine asks whether to download mono and gecko, and the dialog
+        // is modal, so `wineboot` sits behind a prompt the user may not even
+        // see. Proton ships both, never asks, and *uses* mscoree itself — its
+        // xalia overlay is an IL binary — so overriding it there only breaks
+        // things.
+        let boot_env: &[(&str, &str)] = match self.runner.kind {
+            RunnerKind::Wine => &[("WINEDLLOVERRIDES", "mscoree,mshtml=d")],
+            RunnerKind::Proton => &[],
+        };
+        match self.spawn_and_wait_with(&boot_bin, &boot_args, boot_env, None) {
             Ok(0) => self.say("\n# prefix ready\n"),
             Ok(code) => self.say(&format!("\n# wineboot exited {}\n", code)),
             Err(e) => self.say(&format!("\n# wineboot could not run ({})\n", e)),
