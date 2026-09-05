@@ -186,6 +186,8 @@ pub enum AddStep {
     Installer,
     /// Installer: where the new prefix goes.
     Dest,
+    /// Existing: the directory has no wine infrastructure — offer to build it.
+    MakePrefix,
     /// Installer: prefix bitness.
     Arch,
     Runner,
@@ -206,6 +208,8 @@ pub struct AddWizard {
     /// Installer path, kept while the destination prompt has the input focus.
     pub installer: Option<PathBuf>,
     pub dest: Option<PathBuf>,
+    /// Existing game with no prefix: the user asked us to build one first.
+    pub make_prefix: bool,
     pub arch: crate::install::Arch,
     pub scan: Option<ScanResult>,
     pub rx: Option<Receiver<ScanResult>>,
@@ -225,6 +229,7 @@ impl AddWizard {
             prompt: Prompt::new("Directory", &default_games_dir()),
             installer: None,
             dest: None,
+            make_prefix: false,
             arch: crate::install::Arch::Win64,
             scan: None,
             rx: None,
@@ -261,8 +266,9 @@ impl AddWizard {
         w.source = AddSource::Installer;
         w.source_idx = 1;
         w.step = AddStep::Installing;
-        w.installer = Some(job.installer.clone());
+        w.installer = job.installer.clone();
         w.dest = Some(job.dest.clone());
+        w.make_prefix = job.kind == crate::install::JobKind::Prefix;
         w.arch = job.arch;
         w
     }
@@ -274,11 +280,18 @@ impl AddWizard {
             .map(|c| c.path.clone())
     }
 
+    /// Did this wizard build the prefix itself? If so the runner and the arch
+    /// were settled before the exe was picked, so the shared tail skips them.
+    pub fn built_prefix(&self) -> bool {
+        self.source == AddSource::Installer || self.make_prefix
+    }
+
     /// The step to fall back to when the user backs out of the exe list.
     pub fn step_before_exe(&self) -> AddStep {
-        match self.source {
-            AddSource::Existing => AddStep::Path,
-            AddSource::Installer => AddStep::Installing,
+        if self.built_prefix() {
+            AddStep::Installing
+        } else {
+            AddStep::Path
         }
     }
 }
@@ -706,9 +719,13 @@ impl App {
         // announced, once.
         if let Some(job) = &self.install {
             if !job.is_live() && !self.install_announced {
-                let phase = job.phase();
+                let (phase, kind) = (job.phase(), job.kind);
+                let prefix_only = kind == crate::install::JobKind::Prefix;
                 self.install_announced = true;
                 match phase {
+                    crate::install::Phase::Done { code: 0 } if prefix_only => {
+                        self.note("prefix ready — press 'a' to pick the game's executable")
+                    }
                     crate::install::Phase::Done { code: 0 } => {
                         self.note("installer finished — press 'a' to register the game")
                     }
@@ -716,8 +733,11 @@ impl App {
                         "installer exited with status {} — press 'a' to look at it",
                         code
                     )),
+                    crate::install::Phase::Cancelled if prefix_only => {
+                        self.note("prefix creation cancelled")
+                    }
                     crate::install::Phase::Cancelled => self.note("install cancelled"),
-                    other => self.fail(other.label()),
+                    other => self.fail(other.label(kind)),
                 }
             }
         }
@@ -1338,7 +1358,11 @@ impl App {
         if key.code == KeyCode::Esc {
             // An install keeps running: it belongs to the app, not the overlay.
             if w.step == AddStep::Installing && self.install.as_ref().is_some_and(|j| j.is_live()) {
-                self.note("install continues in the background — press 'a' to look in on it");
+                self.note(if w.make_prefix {
+                    "the prefix is still being built — press 'a' to look in on it"
+                } else {
+                    "install continues in the background — press 'a' to look in on it"
+                });
             }
             return; // drops the wizard, back to normal mode
         }
@@ -1473,6 +1497,30 @@ impl App {
                 }
             },
 
+            // -- existing game, but nothing has ever run here --------------
+            AddStep::MakePrefix => match key.code {
+                KeyCode::Enter | KeyCode::Char('y') => {
+                    let exes = w.scan.as_ref().map(|s| s.candidates.len()).unwrap_or(0);
+                    if self.runners.is_empty() {
+                        w.error = Some("no runners found — install proton or wine".into());
+                    } else if exes == 0 {
+                        // A prefix with nothing to launch in it is just clutter.
+                        w.error = Some("no .exe here either — nothing to build a prefix for".into());
+                    } else {
+                        w.make_prefix = true;
+                        w.step = AddStep::Runner;
+                    }
+                }
+                KeyCode::Backspace | KeyCode::Char('n') | KeyCode::Up => {
+                    w.prompt = Prompt::new(
+                        "Directory",
+                        &w.dest.clone().unwrap_or_default().to_string_lossy(),
+                    );
+                    w.step = AddStep::Path;
+                }
+                _ => {}
+            },
+
             AddStep::Arch => match key.code {
                 KeyCode::Char('j') | KeyCode::Down | KeyCode::Char('k') | KeyCode::Up
                 | KeyCode::Tab | KeyCode::Char(' ') => {
@@ -1482,10 +1530,14 @@ impl App {
                     };
                 }
                 KeyCode::Backspace => w.step = AddStep::Runner,
-                KeyCode::Enter => match self.start_install(&w) {
-                    Ok(()) => w.step = AddStep::Installing,
-                    Err(e) => w.error = Some(e),
-                },
+                KeyCode::Enter => {
+                    let started =
+                        if w.make_prefix { self.start_prefix(&w) } else { self.start_install(&w) };
+                    match started {
+                        Ok(()) => w.step = AddStep::Installing,
+                        Err(e) => w.error = Some(e),
+                    }
+                }
                 _ => {}
             },
 
@@ -1508,7 +1560,7 @@ impl App {
                             Some(job) => {
                                 w.error = Some(format!(
                                     "{} — nothing to register",
-                                    job.phase().label()
+                                    job.phase().label(job.kind)
                                 ));
                             }
                             None => w.error = Some("no install is running".into()),
@@ -1540,7 +1592,7 @@ impl App {
                     KeyCode::Enter => {
                         if n == 0 {
                             w.error = Some("no candidate executables found".into());
-                        } else if w.source == AddSource::Installer {
+                        } else if w.built_prefix() {
                             // The runner was already chosen to build the prefix.
                             if w.name.is_empty() {
                                 w.name = default_name(&w);
@@ -1568,6 +1620,7 @@ impl App {
                     KeyCode::Char('k') | KeyCode::Up => w.runner_idx = w.runner_idx.saturating_sub(1),
                     KeyCode::Backspace => {
                         w.step = match w.source {
+                            AddSource::Existing if w.make_prefix => AddStep::MakePrefix,
                             AddSource::Existing => AddStep::Exe,
                             AddSource::Installer => AddStep::Dest,
                         }
@@ -1575,7 +1628,7 @@ impl App {
                     KeyCode::Enter => {
                         if n == 0 {
                             w.error = Some("no runners found — install proton or wine".into());
-                        } else if w.source == AddSource::Installer {
+                        } else if w.built_prefix() {
                             w.step = AddStep::Arch;
                         } else {
                             if w.name.is_empty() {
@@ -1595,10 +1648,7 @@ impl App {
                     w.step = AddStep::Confirm;
                 }
                 KeyCode::Backspace if w.prompt.value.is_empty() => {
-                    w.step = match w.source {
-                        AddSource::Existing => AddStep::Runner,
-                        AddSource::Installer => AddStep::Exe,
-                    }
+                    w.step = if w.built_prefix() { AddStep::Exe } else { AddStep::Runner };
                 }
                 _ => {
                     Self::prompt_key(&mut w.prompt, key);
@@ -1608,8 +1658,8 @@ impl App {
             AddStep::Confirm => match key.code {
                 KeyCode::Enter | KeyCode::Char('y') => match self.add_from_wizard(&w) {
                     Ok(()) => {
-                        // The install is registered; forget the finished job.
-                        if w.source == AddSource::Installer {
+                        // The game is registered; forget the finished job.
+                        if w.built_prefix() {
                             self.install = None;
                         }
                         return;
@@ -1719,6 +1769,24 @@ impl App {
         self.mode = Mode::Overlay(Overlay::Gamescope(Box::new(form)));
     }
 
+    /// Build a wine prefix around a game directory that has none. Unlike an
+    /// install the directory is expected to have files in it already — we are
+    /// only adding `drive_c` and the registry beside them.
+    fn start_prefix(&mut self, w: &AddWizard) -> Result<(), String> {
+        if self.install.as_ref().is_some_and(|j| j.is_live()) {
+            return Err("a job is already running".into());
+        }
+        let dest = w.dest.clone().ok_or("no directory chosen")?;
+        let runner = self
+            .runners
+            .get(w.runner_idx)
+            .cloned()
+            .ok_or("no runner available — install proton or wine")?;
+        self.install = Some(crate::install::InstallJob::boot(dest, runner, w.arch));
+        self.install_announced = false;
+        Ok(())
+    }
+
     /// Kick off the installer described by the wizard.
     fn start_install(&mut self, w: &AddWizard) -> Result<(), String> {
         if self.install.as_ref().is_some_and(|j| j.is_live()) {
@@ -1749,10 +1817,19 @@ impl App {
             w.rx = None;
             let back = w.step_before_exe();
             if result.prefix.is_none() {
+                if w.source == AddSource::Existing && !w.make_prefix {
+                    // No drive_c here yet. Offer to lay one down rather than
+                    // sending the user away to run `wineboot` by hand.
+                    w.dest = Some(result.root.clone());
+                    w.scan = Some(result);
+                    w.step = AddStep::MakePrefix;
+                    return;
+                }
                 w.error = Some(match w.source {
-                    AddSource::Existing => {
-                        "no wine prefix here (need drive_c + system.reg, or a pfx/ subdir)".into()
-                    }
+                    AddSource::Existing => format!(
+                        "still no wine prefix in {} — check the log with 'o'",
+                        result.root.display()
+                    ),
                     AddSource::Installer => format!(
                         "the installer left no wine prefix in {} — check the log with 'o'",
                         result.root.display()

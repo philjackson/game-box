@@ -387,6 +387,10 @@ fn add(frame: &mut Frame, app: &App, area: Rect, w: &AddWizard) {
         AddStep::Path => step_path(frame, rows[1], w),
         AddStep::Installer => step_installer(frame, rows[1], w),
         AddStep::Dest => step_dest(frame, rows[1], w),
+        AddStep::MakePrefix => {
+            step_make_prefix(frame, rows[1], app, w);
+            None
+        }
         AddStep::Arch => {
             step_arch(frame, rows[1], app, w);
             None
@@ -420,10 +424,16 @@ fn add(frame: &mut Frame, app: &App, area: Rect, w: &AddWizard) {
         AddStep::Path => "↵ scan   Tab/^j/^k step through folders   ↑ back   ^u clear   Esc",
         AddStep::Installer => "↵ next   Tab/^j/^k step through entries   ^u clear   Esc cancel",
         AddStep::Dest => "↵ next   Tab/^j/^k step through folders   ↑ back   ^u clear   Esc",
+        AddStep::MakePrefix => "y/↵ build one here   n/⌫ pick another directory   Esc cancel",
+        AddStep::Arch if w.make_prefix => "space toggle   ↵ build the prefix   ⌫ back   Esc cancel",
         AddStep::Arch => "space toggle   ↵ start installing   ⌫ back   Esc cancel",
+        AddStep::Installing if installing_live && w.make_prefix => {
+            "x cancel   o full log   Esc leave it building"
+        }
         AddStep::Installing if installing_live => {
             "x cancel install   o full log   Esc leave it running"
         }
+        AddStep::Installing if w.make_prefix => "↵ scan the prefix   o full log   Esc close",
         AddStep::Installing => "↵ find what it installed   o full log   Esc close",
         AddStep::Scanning => "Esc cancel",
         AddStep::Exe => "j/k choose   ↵ next   ⌫ back   Esc cancel",
@@ -455,6 +465,18 @@ fn add(frame: &mut Frame, app: &App, area: Rect, w: &AddWizard) {
 fn breadcrumb(frame: &mut Frame, area: Rect, w: &AddWizard) {
     // Each source walks a different path through the wizard.
     let steps: &[(AddStep, &str)] = match w.source {
+        // Building the prefix first turns the existing-game path into the
+        // long one: the runner and arch have to be settled up front.
+        AddSource::Existing if w.make_prefix || w.step == AddStep::MakePrefix => &[
+            (AddStep::Path, "path"),
+            (AddStep::MakePrefix, "prefix"),
+            (AddStep::Runner, "runner"),
+            (AddStep::Arch, "arch"),
+            (AddStep::Installing, "create"),
+            (AddStep::Exe, "executable"),
+            (AddStep::Name, "name"),
+            (AddStep::Confirm, "confirm"),
+        ],
         AddSource::Existing => &[
             (AddStep::Path, "path"),
             (AddStep::Exe, "executable"),
@@ -480,6 +502,7 @@ fn breadcrumb(frame: &mut Frame, area: Rect, w: &AddWizard) {
             .unwrap_or(match s {
                 // Steps that have no chip of their own borrow their neighbour's.
                 AddStep::Scanning => match w.source {
+                    AddSource::Existing if w.make_prefix => 5,
                     AddSource::Existing => 1,
                     AddSource::Installer => 5,
                 },
@@ -606,6 +629,67 @@ fn step_dest(frame: &mut Frame, area: Rect, w: &AddWizard) -> Option<(u16, u16)>
     Some((cursor_x, 1))
 }
 
+/// The directory holds a game but nothing wine has ever run in: no `drive_c`,
+/// no registry. Say so plainly and offer to build one in place.
+fn step_make_prefix(frame: &mut Frame, area: Rect, app: &App, w: &AddWizard) {
+    let vw = area.width.saturating_sub(13) as usize;
+    let dir = w.dest.clone().unwrap_or_default();
+    let exes = w.scan.as_ref().map(|s| s.candidates.len()).unwrap_or(0);
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            " ⚠ no wine prefix here — no drive_c, no registry.",
+            Style::default().fg(theme::WARN).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        field("directory", ellipsize_left(&dir.to_string_lossy(), vw)),
+        field(
+            "exes",
+            format!("{} candidate{} found", exes, if exes == 1 { "" } else { "s" }),
+        ),
+        Line::from(""),
+        Line::from(Span::styled(
+            " game-box can build one around the game, in place. Nothing is",
+            Style::default().fg(theme::FG),
+        )),
+        Line::from(Span::styled(
+            " installed and nothing already in the directory is touched — wine",
+            Style::default().fg(theme::FG),
+        )),
+        Line::from(Span::styled(
+            " just adds its own drive_c and registry alongside your files:",
+            Style::default().fg(theme::FG),
+        )),
+        Line::from(""),
+    ];
+
+    // Where it lands depends on the runner, which is the very next step.
+    let pw = area.width.saturating_sub(17) as usize;
+    for (kind, where_) in [("with wine", dir.clone()), ("with proton", dir.join("pfx"))] {
+        lines.push(Line::from(vec![
+            Span::styled(format!("   {:<12}", kind), Style::default().fg(theme::DIM)),
+            Span::styled(
+                ellipsize_left(&where_.to_string_lossy(), pw),
+                Style::default().fg(theme::ACCENT),
+            ),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    if app.runners.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " ✗ no wine or proton found — install one first.",
+            Style::default().fg(theme::BAD),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            " You pick the runner and the bitness next.",
+            Style::default().fg(theme::DIM),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
 fn step_arch(frame: &mut Frame, area: Rect, app: &App, w: &AddWizard) {
     let proton = app
         .runners
@@ -643,7 +727,11 @@ fn step_arch(frame: &mut Frame, area: Rect, app: &App, w: &AddWizard) {
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        " ↵ starts the installer. Its windows open on your desktop as usual.",
+        if w.make_prefix {
+            " ↵ builds the prefix. It takes a minute, and runs nothing."
+        } else {
+            " ↵ starts the installer. Its windows open on your desktop as usual."
+        },
         Style::default().fg(theme::DIM),
     )));
     frame.render_widget(Paragraph::new(lines), area);
@@ -682,7 +770,7 @@ fn step_installing(frame: &mut Frame, area: Rect, app: &App) {
         Line::from(vec![
             Span::styled(format!(" {} ", mark), mark_style),
             Span::styled(
-                phase.label(),
+                phase.label(job.kind),
                 Style::default()
                     .fg(if live { theme::FG } else { mark_style.fg.unwrap_or(theme::FG) })
                     .add_modifier(Modifier::BOLD),
@@ -693,7 +781,10 @@ fn step_installing(frame: &mut Frame, area: Rect, app: &App) {
             ),
         ]),
         Line::from(""),
-        field("installer", ellipsize_left(&job.installer.to_string_lossy(), vw)),
+        match &job.installer {
+            Some(i) => field("installer", ellipsize_left(&i.to_string_lossy(), vw)),
+            None => field("game dir", ellipsize_left(&job.dest.to_string_lossy(), vw)),
+        },
         field("prefix", ellipsize_left(&job.prefix.to_string_lossy(), vw)),
         field(
             "runner",
@@ -728,6 +819,11 @@ fn step_installing(frame: &mut Frame, area: Rect, app: &App) {
         lines.push(Line::from(Span::styled(
             "   ↵ to scan the new prefix and pick the game's executable",
             Style::default().fg(theme::GOOD),
+        )));
+    } else if let Phase::Failed(e) = &phase {
+        lines.push(Line::from(Span::styled(
+            format!("   {} — press o for the full log", e),
+            Style::default().fg(theme::BAD),
         )));
     }
     lines.push(Line::from(""));

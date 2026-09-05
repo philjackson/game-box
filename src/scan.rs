@@ -303,6 +303,7 @@ pub fn expand_tilde(input: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn squash_normalises_punctuation() {
@@ -319,6 +320,57 @@ mod tests {
         assert!(denied_dir("drive_c/windows/system32"));
         assert!(!denied_dir("drive_c/Games/Windows Central"));
         assert!(!denied_dir("drive_c/Games/Prodeus"));
+    }
+
+    /// A scratch directory that cleans itself up.
+    struct Tmp(PathBuf);
+    impl Tmp {
+        fn new(tag: &str) -> Tmp {
+            let dir = std::env::temp_dir().join(format!("gbox-{}-{}", tag, std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            Tmp(dir)
+        }
+    }
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The check that decides whether the add wizard offers to build a prefix.
+    #[test]
+    fn a_bare_game_directory_is_not_mistaken_for_a_prefix() {
+        let tmp = Tmp::new("bare");
+        let game = tmp.0.join("MyGame");
+        fs::create_dir_all(&game).unwrap();
+        fs::write(game.join("MyGame.exe"), b"MZ").unwrap();
+
+        // Game files but no wine infrastructure: this is what we offer to fix.
+        assert!(!is_prefix(&game));
+        assert_eq!(find_prefix(&game), None);
+
+        // drive_c alone is not enough — a stray folder of that name is common.
+        fs::create_dir_all(game.join("drive_c")).unwrap();
+        assert!(!is_prefix(&game));
+
+        // wineboot leaves the registry behind, and that settles it.
+        fs::write(game.join("system.reg"), b"WINE REGISTRY").unwrap();
+        assert!(is_prefix(&game));
+        assert_eq!(find_prefix(&game), Some(game.clone()));
+    }
+
+    /// Proton builds into `<dir>/pfx`, which is where we look next.
+    #[test]
+    fn a_proton_prefix_is_found_through_its_pfx_subdirectory() {
+        let tmp = Tmp::new("pfx");
+        let game = tmp.0.join("MyGame");
+        let pfx = game.join("pfx");
+        fs::create_dir_all(pfx.join("drive_c")).unwrap();
+        fs::write(pfx.join("user.reg"), b"WINE REGISTRY").unwrap();
+
+        assert!(!is_prefix(&game));
+        assert_eq!(find_prefix(&game), Some(pfx));
     }
 
     #[test]

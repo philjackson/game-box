@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::library;
 use crate::model::{Runner, RunnerKind};
@@ -40,6 +40,14 @@ impl Arch {
     }
 }
 
+/// What the job is actually for. A prefix job stops once wine has built the
+/// infrastructure; an install job goes on to run the setup .exe inside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobKind {
+    Install,
+    Prefix,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Phase {
     /// Making the destination directory.
@@ -58,13 +66,19 @@ impl Phase {
         matches!(self, Phase::Preparing | Phase::Booting | Phase::Installing)
     }
 
-    pub fn label(&self) -> String {
+    pub fn label(&self, kind: JobKind) -> String {
         match self {
             Phase::Preparing => "preparing destination".into(),
             Phase::Booting => "creating the wine prefix".into(),
             Phase::Installing => "running the installer".into(),
-            Phase::Done { code: 0 } => "installer finished".into(),
-            Phase::Done { code } => format!("installer exited with status {}", code),
+            Phase::Done { code: 0 } => match kind {
+                JobKind::Install => "installer finished".into(),
+                JobKind::Prefix => "prefix ready".into(),
+            },
+            Phase::Done { code } => match kind {
+                JobKind::Install => format!("installer exited with status {}", code),
+                JobKind::Prefix => format!("wineboot exited with status {}", code),
+            },
             Phase::Failed(e) => format!("failed: {}", e),
             Phase::Cancelled => "cancelled".into(),
         }
@@ -73,7 +87,9 @@ impl Phase {
 
 /// A running (or finished) installation.
 pub struct InstallJob {
-    pub installer: PathBuf,
+    pub kind: JobKind,
+    /// `None` for a prefix-only job: there is nothing to run afterwards.
+    pub installer: Option<PathBuf>,
     pub dest: PathBuf,
     /// Where the WINEPREFIX ends up: `dest` for wine, `dest/pfx` for proton.
     pub prefix: PathBuf,
@@ -135,22 +151,50 @@ impl InstallJob {
         }
     }
 
-    /// Start the job. Returns immediately; watch [`InstallJob::phase`].
-    pub fn start(installer: PathBuf, dest: PathBuf, runner: Runner, arch: Arch) -> InstallJob {
-        let prefix = match runner.kind {
+    /// Where a job against `dest` puts its WINEPREFIX.
+    pub fn prefix_for(dest: &Path, runner: &Runner) -> PathBuf {
+        match runner.kind {
             // Proton insists on managing `<compat>/pfx` itself.
             RunnerKind::Proton => dest.join("pfx"),
-            RunnerKind::Wine => dest.clone(),
-        };
+            RunnerKind::Wine => dest.to_path_buf(),
+        }
+    }
+
+    /// Run an installer inside a fresh prefix. Returns immediately; watch
+    /// [`InstallJob::phase`].
+    pub fn start(installer: PathBuf, dest: PathBuf, runner: Runner, arch: Arch) -> InstallJob {
+        Self::spawn(JobKind::Install, Some(installer), dest, runner, arch)
+    }
+
+    /// Build a prefix around a game that is already unpacked in `dest`, and
+    /// stop there. Nothing is installed: this only lays down `drive_c` and the
+    /// registry a game needs to run at all.
+    pub fn boot(dest: PathBuf, runner: Runner, arch: Arch) -> InstallJob {
+        Self::spawn(JobKind::Prefix, None, dest, runner, arch)
+    }
+
+    fn spawn(
+        kind: JobKind,
+        installer: Option<PathBuf>,
+        dest: PathBuf,
+        runner: Runner,
+        arch: Arch,
+    ) -> InstallJob {
+        let prefix = Self::prefix_for(&dest, &runner);
         let log = library::log_dir().join(format!(
-            "install-{}.log",
+            "{}-{}.log",
+            match kind {
+                JobKind::Install => "install",
+                JobKind::Prefix => "prefix",
+            },
             crate::model::slugify(&dest.file_name().unwrap_or_default().to_string_lossy())
         ));
 
         let job = InstallJob {
+            kind,
             installer: installer.clone(),
             dest: dest.clone(),
-            prefix,
+            prefix: prefix.clone(),
             runner: runner.clone(),
             arch,
             log: log.clone(),
@@ -165,7 +209,8 @@ impl InstallJob {
         let cancelled = Arc::clone(&job.cancelled);
 
         std::thread::spawn(move || {
-            let worker = Worker { phase, child_slot, cancelled, log, dest, installer, runner, arch };
+            let worker =
+                Worker { phase, child_slot, cancelled, log, dest, prefix, installer, runner, arch };
             worker.run();
         });
 
@@ -179,7 +224,8 @@ struct Worker {
     cancelled: Arc<AtomicBool>,
     log: PathBuf,
     dest: PathBuf,
-    installer: PathBuf,
+    prefix: PathBuf,
+    installer: Option<PathBuf>,
     runner: Runner,
     arch: Arch,
 }
@@ -209,9 +255,17 @@ impl Worker {
             return;
         }
         self.say(&format!(
-            "# game-box install\n# installer {}\n# destination {}\n# runner {} ({}, {})\n",
-            self.installer.display(),
+            "# game-box {}\n{}# destination {}\n# prefix {}\n# runner {} ({}, {})\n",
+            match &self.installer {
+                Some(_) => "install",
+                None => "prefix",
+            },
+            match &self.installer {
+                Some(i) => format!("# installer {}\n", i.display()),
+                None => String::new(),
+            },
             self.dest.display(),
+            self.prefix.display(),
             self.runner.name,
             self.runner.kind.label(),
             self.arch.label(),
@@ -227,22 +281,42 @@ impl Worker {
             RunnerKind::Proton => (self.runner.bin.clone(), vec!["run".into(), "wineboot".into(), "-u".into()]),
             RunnerKind::Wine => (self.runner.bin.clone(), vec!["wineboot".into(), "--init".into()]),
         };
-        match self.spawn_and_wait_with(&boot_bin, &boot_args, &[("WINEDLLOVERRIDES", "mscoree,mshtml=d")]) {
+        let booted =
+            self.spawn_and_wait_with(&boot_bin, &boot_args, &[("WINEDLLOVERRIDES", "mscoree,mshtml=d")]);
+        match &booted {
             Ok(0) => self.say("\n# prefix ready\n"),
-            Ok(code) => self.say(&format!("\n# wineboot exited {} — continuing anyway\n", code)),
-            Err(e) => self.say(&format!("\n# wineboot could not run ({}) — continuing anyway\n", e)),
+            Ok(code) => self.say(&format!("\n# wineboot exited {}\n", code)),
+            Err(e) => self.say(&format!("\n# wineboot could not run ({})\n", e)),
         }
         if self.stopped() {
             self.set(Phase::Cancelled);
             return;
         }
 
+        // A prefix-only job is finished either way, and its verdict is what is
+        // actually on disk: some proton builds report failure having laid the
+        // prefix down perfectly well, and vice versa.
+        if self.installer.is_none() {
+            self.settle();
+            if crate::scan::is_prefix(&self.prefix) {
+                self.set(Phase::Done { code: 0 });
+            } else {
+                self.say("\n# no drive_c/registry appeared — the prefix was not created\n");
+                self.set(Phase::Failed(format!(
+                    "no prefix appeared in {}",
+                    self.prefix.display()
+                )));
+            }
+            return;
+        }
+
         // --- run the installer -------------------------------------------
+        let Some(installer) = self.installer.clone() else { return };
         self.set(Phase::Installing);
-        self.say(&format!("\n# launching {}\n\n", self.installer.display()));
+        self.say(&format!("\n# launching {}\n\n", installer.display()));
         let args: Vec<String> = match self.runner.kind {
-            RunnerKind::Proton => vec!["run".into(), self.installer.to_string_lossy().into()],
-            RunnerKind::Wine => vec![self.installer.to_string_lossy().into()],
+            RunnerKind::Proton => vec!["run".into(), installer.to_string_lossy().into()],
+            RunnerKind::Wine => vec![installer.to_string_lossy().into()],
         };
         match self.spawn_and_wait(&self.runner.bin, &args) {
             Ok(code) => {
@@ -257,6 +331,51 @@ impl Worker {
                 self.say(&format!("\n# could not run the installer: {}\n", e));
                 self.set(Phase::Failed(e));
             }
+        }
+    }
+
+    /// `wineboot` returns as soon as it has handed the work to the wineserver,
+    /// which carries on laying the prefix down behind it — so the registry is
+    /// usually still missing the moment we get control back. Wait for the
+    /// server to go quiet, then for the files to actually appear.
+    fn settle(&self) {
+        if let Some(ws) = crate::runners::wineserver_for(&self.runner) {
+            self.say("\n# waiting for the wineserver to finish\n");
+            self.wait_for_server(&ws);
+        }
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !crate::scan::is_prefix(&self.prefix) && !self.stopped() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    /// `wineserver -w` blocks until the prefix's server exits. Bounded, since
+    /// a wedged server would otherwise hang the job for good.
+    fn wait_for_server(&self, wineserver: &Path) {
+        let mut env = self.env();
+        // Proton's env names the compat directory, not the prefix itself.
+        env.push(("WINEPREFIX".into(), self.prefix.to_string_lossy().into()));
+        let Ok(mut child) = Command::new(wineserver)
+            .arg("-w")
+            .envs(env)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            return;
+        };
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) | Err(_) => return,
+                Ok(None) => {}
+            }
+            if self.stopped() || Instant::now() >= deadline {
+                let _ = child.kill();
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(150));
         }
     }
 
@@ -316,7 +435,8 @@ impl Worker {
             .envs(env)
             .current_dir(
                 self.installer
-                    .parent()
+                    .as_deref()
+                    .and_then(Path::parent)
                     .filter(|p| p.is_dir())
                     .map(Path::to_path_buf)
                     .unwrap_or_else(|| self.dest.clone()),

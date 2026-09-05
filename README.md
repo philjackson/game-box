@@ -11,6 +11,14 @@ gbox --runners       list detected wine/proton installations
 gbox --scan <dir>    show the executables the wizard would offer, with scores
 ```
 
+## No wine prefix yet?
+
+A game copied from another machine, or unpacked from an archive, usually has
+no wine infrastructure beside it — no `drive_c`, no registry. `a` spots that
+and offers to build one in place before going on, so you never have to run
+`wineboot` by hand. Nothing already in the directory is touched: wine's
+prefix simply lands alongside your files (proton puts its own in `pfx/`).
+
 ## Two ways to add a game
 
 `a` opens the wizard on a menu with both; `:add <dir>` and `:install <exe>`
