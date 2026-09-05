@@ -23,6 +23,16 @@ impl RunnerKind {
             RunnerKind::Wine => "wine",
         }
     }
+
+    /// Where a runner puts its WINEPREFIX when handed `dir` to build in.
+    /// Proton insists on managing `<compat>/pfx` itself; wine uses the
+    /// directory as-is.
+    pub fn prefix_in(self, dir: &Path) -> PathBuf {
+        match self {
+            RunnerKind::Proton => dir.join("pfx"),
+            RunnerKind::Wine => dir.to_path_buf(),
+        }
+    }
 }
 
 /// A runner installation discovered on disk.

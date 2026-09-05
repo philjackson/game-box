@@ -304,6 +304,10 @@ pub fn user_path(input: &str) -> PathBuf {
 /// against the first — so `Games/x` becomes `Games/x/Games/x` and the launch
 /// fails somewhere far away from the prompt that accepted it.
 pub fn absolute(path: &Path) -> PathBuf {
+    // Nothing typed is still nothing — not the working directory.
+    if path.as_os_str().is_empty() {
+        return PathBuf::new();
+    }
     let joined = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -322,7 +326,7 @@ pub fn absolute(path: &Path) -> PathBuf {
     out
 }
 
-pub fn expand_tilde(input: &str) -> PathBuf {
+fn expand_tilde(input: &str) -> PathBuf {
     if let Some(rest) = input.strip_prefix("~/") {
         dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")).join(rest)
     } else if input == "~" {
@@ -419,6 +423,8 @@ mod tests {
         assert!(user_path("/nowhere/at/all").is_absolute());
         // `..` never climbs above the root.
         assert_eq!(user_path("/../../x"), PathBuf::from("/x"));
+        // An empty prompt is not a request for the working directory.
+        assert_eq!(user_path(""), PathBuf::new());
     }
 
     #[test]
