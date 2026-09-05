@@ -1,6 +1,7 @@
 //! game-box — a TUI game manager for wine and proton.
 
 mod app;
+mod display;
 mod install;
 mod launch;
 mod library;

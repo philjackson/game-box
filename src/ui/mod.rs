@@ -80,6 +80,14 @@ fn header(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(theme::RUNNING).add_modifier(Modifier::BOLD),
         ));
     }
+    if app.display.is_headless() {
+        // Nothing wine launches can draw; say so before a game is started.
+        left.push(Span::styled(" · ", Style::default().fg(theme::FAINT)));
+        left.push(Span::styled(
+            "⚠ no display",
+            Style::default().fg(theme::BAD).add_modifier(Modifier::BOLD),
+        ));
+    }
     if let Some(job) = &app.install {
         left.push(Span::styled(" · ", Style::default().fg(theme::FAINT)));
         if job.is_live() {

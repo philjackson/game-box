@@ -512,6 +512,9 @@ pub struct App {
     pub should_quit: bool,
     /// At most one installer runs at a time. It outlives the wizard overlay so
     /// the user can close it and carry on browsing.
+    /// Cached graphical-session state, refreshed on the slow tick. wine cannot
+    /// draw without one, so it belongs on screen rather than in a log.
+    pub display: crate::display::Display,
     pub install: Option<crate::install::InstallJob>,
     install_announced: bool,
     size_rx: Option<Receiver<(String, u64)>>,
@@ -543,6 +546,7 @@ impl App {
             message_tick: 0,
             tick: 0,
             should_quit: false,
+            display: crate::display::detect(),
             install: None,
             install_announced: false,
             size_rx: None,
@@ -704,6 +708,10 @@ impl App {
         if self.tick % 5 == 0 {
             self.sys.tick();
         }
+        // A session can appear (or vanish) under us; keep the warning honest.
+        if self.tick % 50 == 0 {
+            self.display = crate::display::detect();
+        }
 
         if let Some(rx) = &self.size_rx {
             let mut got = false;
@@ -799,7 +807,12 @@ impl App {
         let runner = runner.clone();
         match launch::launch(&game, &runner) {
             Ok(session) => {
-                self.note(format!("launched {} with {}", game.name, runner.name));
+                let mut msg = format!("launched {} with {}", game.name, runner.name);
+                if let Some(note) = launch::display_note() {
+                    msg.push_str(" — ");
+                    msg.push_str(&note);
+                }
+                self.note(msg);
                 self.sessions.push(session);
                 self.rebuild_collections();
                 self.refresh_view();
@@ -1018,6 +1031,7 @@ impl App {
             KeyCode::Char('v') => self.show_preview = !self.show_preview,
             KeyCode::Char('$') => {
                 self.runners = runners::discover();
+                self.display = crate::display::detect();
                 for g in &mut self.lib.games {
                     g.size_bytes = None;
                 }

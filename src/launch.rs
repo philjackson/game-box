@@ -9,6 +9,7 @@ use anyhow::{anyhow, Result};
 use chrono::Utc;
 
 use crate::library;
+use crate::display::{self, Display};
 use crate::model::{Game, Runner, RunnerKind};
 use crate::runners;
 
@@ -38,7 +39,18 @@ pub fn build_command(game: &Game, runner: &Runner) -> Result<(PathBuf, Vec<Strin
         .ok_or_else(|| anyhow!("executable path is not valid UTF-8"))?
         .to_string();
 
-    let mut env: Vec<(String, String)> = Vec::new();
+    // Without a display wine loads no graphics driver and the game runs
+    // resident but invisible, which reads as a successful launch.
+    let display = display::detect();
+    if display.is_headless() {
+        return Err(anyhow!(
+            "no graphical session: neither DISPLAY nor WAYLAND_DISPLAY is set and no \
+             wayland or X socket was found. Run game-box from inside your desktop \
+             session, or export the display first"
+        ));
+    }
+
+    let mut env: Vec<(String, String)> = display.vars();
     let mut args: Vec<String> = Vec::new();
 
     match runner.kind {
@@ -113,6 +125,17 @@ fn shell_quote(s: &str) -> String {
         s.to_string()
     } else {
         format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
+/// How the display was resolved, for the status line after a launch.
+pub fn display_note() -> Option<String> {
+    match display::detect() {
+        Display::Recovered { how, .. } => Some(format!(
+            "this shell has no DISPLAY — using the session's {}",
+            how
+        )),
+        _ => None,
     }
 }
 

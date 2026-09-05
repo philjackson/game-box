@@ -241,6 +241,14 @@ impl Worker {
     }
 
     fn run(self) {
+        if crate::display::detect().is_headless() {
+            self.set(Phase::Failed(
+                "no graphical session (no DISPLAY or WAYLAND_DISPLAY, and no socket to \
+                 fall back on) — the installer would draw nothing"
+                    .into(),
+            ));
+            return;
+        }
         if let Err(e) = fs::create_dir_all(&self.dest) {
             self.set(Phase::Failed(format!("cannot create {}: {}", self.dest.display(), e)));
             return;
@@ -355,11 +363,13 @@ impl Worker {
 
     /// Environment shared by the boot step and the installer itself.
     fn env(&self) -> Vec<(String, String)> {
-        let mut env = vec![
+        // An installer with no display is as invisible as a game with none.
+        let mut env = crate::display::detect().vars();
+        env.extend(vec![
             // Keep `err:` and `warn:` — they are how a failed install explains
             // itself — but drop wine's very chatty fixme channel.
             ("WINEDEBUG".to_string(), "fixme-all".to_string()),
-        ];
+        ]);
         match self.runner.kind {
             RunnerKind::Proton => {
                 let steam = dirs::home_dir()
