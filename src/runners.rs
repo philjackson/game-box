@@ -97,7 +97,7 @@ pub fn resolve<'a>(runners: &'a [Runner], want: &RunnerRef) -> Option<&'a Runner
         .or_else(|| runners.iter().find(|r| r.kind == want.kind))
 }
 
-fn which(bin: &str) -> Option<PathBuf> {
+pub fn which(bin: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
         .map(|p| p.join(bin))

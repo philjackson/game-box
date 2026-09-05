@@ -246,11 +246,11 @@ fn index(frame: &mut Frame, app: &mut App, area: Rect) {
     let size_w = 6;
     let played_w = 9;
     let time_w = 6;
-    let fixed = 3 + runner_w + size_w + played_w + time_w + 4;
+    let fixed = 4 + runner_w + size_w + played_w + time_w + 4;
     let name_w = w.saturating_sub(fixed).max(8);
 
     let head = Line::from(vec![
-        Span::styled("   ", Style::default()),
+        Span::styled("    ", Style::default()),
         Span::styled(format!("{:<w$} ", "GAME", w = name_w), Style::default().fg(theme::DIM)),
         Span::styled(format!("{:<w$} ", "RUNNER", w = runner_w), Style::default().fg(theme::DIM)),
         Span::styled(format!("{:>w$} ", "SIZE", w = size_w), Style::default().fg(theme::DIM)),
@@ -332,9 +332,17 @@ fn index(frame: &mut Frame, app: &mut App, area: Rect) {
             human_duration(g.playtime_secs)
         };
 
+        // Second flag column: gamescope is a launch-changing setting, so it
+        // deserves to be visible without opening the game.
+        let gs_flag = if g.gamescope.enabled { "g" } else { " " };
+
         lines.push(Line::from(vec![
             Span::styled(cursor_mark, Style::default().fg(theme::ACCENT)),
             Span::styled(flag, if selected { base } else { flag_style }),
+            Span::styled(
+                gs_flag,
+                if selected { base } else { Style::default().fg(theme::HILITE) },
+            ),
             Span::styled(" ", base),
             Span::styled(
                 format!("{:<w$} ", ellipsize(&g.name, name_w), w = name_w),
@@ -439,6 +447,7 @@ fn hints() -> Line<'static> {
         ("↵", "play"),
         ("x", "kill"),
         ("R", "runner"),
+        ("w", "gamescope"),
         ("o", "log"),
         ("d", "remove"),
         ("/", "search"),

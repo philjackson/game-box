@@ -59,9 +59,29 @@ shows the phase, elapsed time and a live tail of the wine log.
 Same escalation applies to a running game: `x` asks it to quit, a second `x`
 takes the whole prefix down through its wineserver.
 
+## gamescope
+
+`w` (or `:gamescope`) opens per-game settings: on/off, output resolution
+(`-W`/`-H`), the resolution the game renders at (`-w`/`-h`), fullscreen /
+borderless / windowed, an fps cap (`-r`), the upscaler (`-F linear|nearest|
+fsr|nis|pixel`), `--mangoapp`, and a free-form field for anything else.
+
+When it is on, gamescope becomes the program that gets executed and the runner
+is what it hosts:
+
+```
+gamescope -W 2560 -H 1440 -w 1920 -h 1080 -f -r 60 -F fsr -- <proton|wine> <game.exe>
+```
+
+The editor previews that line as you type, and games launching under gamescope
+carry a `g` flag in the index. Enabling it without gamescope on `$PATH` is
+allowed but says so, and the launch fails with a clear message rather than
+silently running without it.
+
 ## Keys
 
-`j`/`k` move · `Enter` play · `x` kill · `a` add · `i` install · `R` runner · `C` winecfg ·
+`j`/`k` move · `Enter` play · `x` kill · `a` add · `i` install · `R` runner ·
+`w` gamescope · `C` winecfg ·
 `o` log · `d` remove · `/` search · `s` sort · `b`/`v` panes · `:` command ·
 `?` full help · `q` quit.
 

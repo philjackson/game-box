@@ -51,6 +51,184 @@ impl RunnerRef {
     }
 }
 
+/// How gamescope should present the game's window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum WindowMode {
+    #[default]
+    Fullscreen,
+    Borderless,
+    Windowed,
+}
+
+impl WindowMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            WindowMode::Fullscreen => "fullscreen",
+            WindowMode::Borderless => "borderless",
+            WindowMode::Windowed => "windowed",
+        }
+    }
+
+    pub fn flag(self) -> Option<&'static str> {
+        match self {
+            WindowMode::Fullscreen => Some("-f"),
+            WindowMode::Borderless => Some("-b"),
+            WindowMode::Windowed => None,
+        }
+    }
+
+    pub fn next(self) -> WindowMode {
+        match self {
+            WindowMode::Fullscreen => WindowMode::Borderless,
+            WindowMode::Borderless => WindowMode::Windowed,
+            WindowMode::Windowed => WindowMode::Fullscreen,
+        }
+    }
+}
+
+/// gamescope's upscaler filter (`-F`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Filter {
+    Linear,
+    Nearest,
+    Fsr,
+    Nis,
+    Pixel,
+}
+
+impl Filter {
+    pub fn label(self) -> &'static str {
+        match self {
+            Filter::Linear => "linear",
+            Filter::Nearest => "nearest",
+            Filter::Fsr => "fsr",
+            Filter::Nis => "nis",
+            Filter::Pixel => "pixel",
+        }
+    }
+
+    /// Cycle including "off", which is why this takes and returns an Option.
+    pub fn next(current: Option<Filter>) -> Option<Filter> {
+        match current {
+            None => Some(Filter::Linear),
+            Some(Filter::Linear) => Some(Filter::Nearest),
+            Some(Filter::Nearest) => Some(Filter::Fsr),
+            Some(Filter::Fsr) => Some(Filter::Nis),
+            Some(Filter::Nis) => Some(Filter::Pixel),
+            Some(Filter::Pixel) => None,
+        }
+    }
+}
+
+/// Per-game gamescope settings. gamescope is a nested compositor: it wraps the
+/// runner command, so the game renders into it rather than onto the desktop.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct Gamescope {
+    #[serde(default)]
+    pub enabled: bool,
+    /// `-W`/`-H`: the size of gamescope's own output. None lets it decide.
+    #[serde(default)]
+    pub output: Option<(u32, u32)>,
+    /// `-w`/`-h`: what the game renders at, upscaled to the output.
+    #[serde(default)]
+    pub game: Option<(u32, u32)>,
+    #[serde(default)]
+    pub mode: WindowMode,
+    /// `-r`: cap the game's frame rate.
+    #[serde(default)]
+    pub fps_limit: Option<u32>,
+    #[serde(default)]
+    pub filter: Option<Filter>,
+    /// `--mangoapp`: the mangohud overlay, composited by gamescope itself.
+    #[serde(default)]
+    pub mangoapp: bool,
+    /// Anything else, passed through verbatim.
+    #[serde(default)]
+    pub extra: Vec<String>,
+}
+
+impl Gamescope {
+    /// The arguments that go before `--`.
+    pub fn args(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        if let Some((w, h)) = self.output {
+            out.push("-W".into());
+            out.push(w.to_string());
+            out.push("-H".into());
+            out.push(h.to_string());
+        }
+        if let Some((w, h)) = self.game {
+            out.push("-w".into());
+            out.push(w.to_string());
+            out.push("-h".into());
+            out.push(h.to_string());
+        }
+        if let Some(flag) = self.mode.flag() {
+            out.push(flag.into());
+        }
+        if let Some(fps) = self.fps_limit {
+            out.push("-r".into());
+            out.push(fps.to_string());
+        }
+        if let Some(filter) = self.filter {
+            out.push("-F".into());
+            out.push(filter.label().into());
+        }
+        if self.mangoapp {
+            out.push("--mangoapp".into());
+        }
+        out.extend(self.extra.iter().cloned());
+        out
+    }
+
+    /// One-line description for the index and detail pane.
+    pub fn summary(&self) -> String {
+        if !self.enabled {
+            return "off".into();
+        }
+        let mut parts: Vec<String> = vec![self.mode.label().to_string()];
+        match (self.game, self.output) {
+            (Some((gw, gh)), Some((ow, oh))) => parts.push(format!("{}x{} → {}x{}", gw, gh, ow, oh)),
+            (None, Some((ow, oh))) => parts.push(format!("{}x{}", ow, oh)),
+            (Some((gw, gh)), None) => parts.push(format!("{}x{} → native", gw, gh)),
+            (None, None) => parts.push("native".into()),
+        }
+        if let Some(f) = self.filter {
+            parts.push(f.label().to_string());
+        }
+        if let Some(fps) = self.fps_limit {
+            parts.push(format!("{}fps", fps));
+        }
+        if self.mangoapp {
+            parts.push("mangoapp".into());
+        }
+        parts.join(" · ")
+    }
+}
+
+/// Parse a `WIDTHxHEIGHT` pair; an empty string means "unset".
+pub fn parse_resolution(s: &str) -> Result<Option<(u32, u32)>, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Ok(None);
+    }
+    let (w, h) = s
+        .split_once(['x', 'X', '*'])
+        .ok_or_else(|| format!("\"{}\" is not WIDTHxHEIGHT", s))?;
+    let w: u32 = w.trim().parse().map_err(|_| format!("\"{}\" is not a width", w.trim()))?;
+    let h: u32 = h.trim().parse().map_err(|_| format!("\"{}\" is not a height", h.trim()))?;
+    if w == 0 || h == 0 {
+        return Err("resolution cannot be zero".into());
+    }
+    Ok(Some((w, h)))
+}
+
+pub fn format_resolution(res: Option<(u32, u32)>) -> String {
+    res.map(|(w, h)| format!("{}x{}", w, h)).unwrap_or_default()
+}
+
 /// One entry in the library.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Game {
@@ -71,6 +249,8 @@ pub struct Game {
     pub tags: Vec<String>,
     #[serde(default)]
     pub notes: String,
+    #[serde(default)]
+    pub gamescope: Gamescope,
     pub added: DateTime<Utc>,
     #[serde(default)]
     pub last_played: Option<DateTime<Utc>>,
@@ -230,6 +410,42 @@ mod tests {
     }
 
     #[test]
+    fn resolutions_round_trip_and_reject_junk() {
+        assert_eq!(parse_resolution(""), Ok(None));
+        assert_eq!(parse_resolution(" 2560x1440 "), Ok(Some((2560, 1440))));
+        assert_eq!(parse_resolution("1920X1080"), Ok(Some((1920, 1080))));
+        assert!(parse_resolution("1920").is_err());
+        assert!(parse_resolution("axb").is_err());
+        assert!(parse_resolution("0x1080").is_err());
+        assert_eq!(format_resolution(Some((1280, 720))), "1280x720");
+        assert_eq!(format_resolution(None), "");
+    }
+
+    #[test]
+    fn gamescope_args_follow_the_documented_flags() {
+        let gs = Gamescope {
+            enabled: true,
+            output: Some((2560, 1440)),
+            game: Some((1920, 1080)),
+            mode: WindowMode::Fullscreen,
+            fps_limit: Some(60),
+            filter: Some(Filter::Fsr),
+            mangoapp: true,
+            extra: vec!["--force-grab-cursor".into()],
+        };
+        assert_eq!(
+            gs.args(),
+            vec![
+                "-W", "2560", "-H", "1440", "-w", "1920", "-h", "1080", "-f", "-r", "60", "-F",
+                "fsr", "--mangoapp", "--force-grab-cursor",
+            ]
+        );
+        // Windowed contributes no flag at all.
+        let plain = Gamescope { mode: WindowMode::Windowed, ..Default::default() };
+        assert!(plain.args().is_empty());
+    }
+
+    #[test]
     fn flat_lutris_prefix_resolves_its_own_compat_path() {
         let g = Game {
             id: "x".into(),
@@ -242,6 +458,7 @@ mod tests {
             working_dir: None,
             tags: vec![],
             notes: String::new(),
+            gamescope: Gamescope::default(),
             added: Utc::now(),
             last_played: None,
             playtime_secs: 0,

@@ -10,6 +10,7 @@ use chrono::Utc;
 
 use crate::library;
 use crate::model::{Game, Runner, RunnerKind};
+use crate::runners;
 
 /// A game we have started and are still watching.
 #[derive(Debug)]
@@ -71,6 +72,18 @@ pub fn build_command(game: &Game, runner: &Runner) -> Result<(PathBuf, Vec<Strin
     args.extend(game.args.iter().cloned());
     for (k, v) in &game.env {
         env.push((k.clone(), v.clone()));
+    }
+
+    // gamescope is a nested compositor: it takes its own options, then `--`,
+    // then the command it should host — so it becomes the program we exec.
+    if game.gamescope.enabled {
+        let bin = runners::which("gamescope")
+            .ok_or_else(|| anyhow!("gamescope is enabled for this game but is not on $PATH"))?;
+        let mut wrapped = game.gamescope.args();
+        wrapped.push("--".into());
+        wrapped.push(runner.bin.to_string_lossy().into_owned());
+        wrapped.extend(args);
+        return Ok((bin, wrapped, env));
     }
 
     Ok((runner.bin.clone(), args, env))

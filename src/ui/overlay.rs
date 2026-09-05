@@ -8,7 +8,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use super::widgets::*;
-use crate::app::{AddSource, AddStep, AddWizard, App, Mode, Overlay, Prompt};
+use crate::app::{AddSource, AddStep, AddWizard, App, GsField, GsForm, Mode, Overlay, Prompt};
 use crate::install::{Arch, Phase};
 use crate::launch;
 use crate::model::*;
@@ -21,6 +21,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         Overlay::Add(w) => add(frame, app, area, w),
         Overlay::Confirm { message, .. } => confirm(frame, area, message),
         Overlay::RunnerPick { idx, .. } => runner_pick(frame, app, area, *idx),
+        Overlay::Gamescope(f) => gamescope(frame, app, area, f),
         Overlay::Log { title, lines, scroll } => log(frame, area, title, lines, *scroll),
     }
 }
@@ -70,6 +71,7 @@ fn help(frame: &mut Frame, area: Rect, scroll: u16) {
     row(&mut lines, "Enter / p", "play the selected game");
     row(&mut lines, "x", "terminate the running game");
     row(&mut lines, "R", "change the wine/proton runner");
+    row(&mut lines, "w", "gamescope settings for this game");
     row(&mut lines, "C", "open winecfg on the prefix");
     row(&mut lines, "o", "read the last launch log");
     row(&mut lines, "d", "remove from library (files stay)");
@@ -90,11 +92,13 @@ fn help(frame: &mut Frame, area: Rect, scroll: u16) {
     row(&mut lines, ":sort <k>", "name | played | time | size | added");
     row(&mut lines, ":log", "launch log");
     row(&mut lines, ":winecfg", "winecfg on the prefix");
+    row(&mut lines, ":gamescope", "gamescope settings (also :gs)");
     row(&mut lines, ":q", "quit");
 
     section(&mut lines, "flags in the index");
     row(&mut lines, "▶", "running right now");
     row(&mut lines, "N", "never played");
+    row(&mut lines, "g", "launches inside gamescope");
     row(&mut lines, "!", "executable is missing from disk");
 
     lines.push(Line::from(""));
@@ -177,6 +181,144 @@ fn runner_pick(frame: &mut Frame, app: &App, area: Rect, idx: usize) {
     lines.push(Line::from(""));
     lines.push(footer("↵ select   Esc cancel"));
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+// -------------------------------------------------- gamescope settings ---
+
+fn gamescope(frame: &mut Frame, app: &App, area: Rect, f: &GsForm) {
+    let rows = GsField::ALL.len() as u16;
+    let area = centered_fixed(78.min(area.width), (rows + 12).min(area.height), area);
+    let inner = panel(
+        frame,
+        area,
+        &format!("gamescope · {}", ellipsize(&f.game_name, 24)),
+    );
+
+    // Row layout: gutter, then a fixed-width label, then the value. The
+    // cursor offset has to be derived from these or it drifts.
+    const GUTTER_W: u16 = 2;
+    const LABEL_W: u16 = 12;
+    let value_x = GUTTER_W + LABEL_W;
+
+    let mut lines: Vec<Line> = Vec::new();
+    let mut cursor: Option<(u16, u16)> = None;
+    let value_w = inner.width.saturating_sub(value_x + 1);
+
+    for (i, field) in GsField::ALL.iter().enumerate() {
+        let picked = i == f.field;
+        let label_style = if picked {
+            Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme::DIM)
+        };
+        // A dimmed body makes it obvious that the rest only matters when on.
+        let live = f.enabled || *field == GsField::Enabled;
+        let value_style = if picked {
+            theme::selected()
+        } else if live {
+            Style::default().fg(theme::FG)
+        } else {
+            Style::default().fg(theme::FAINT)
+        };
+
+        let value: String = match field {
+            GsField::Enabled => if f.enabled { "on".into() } else { "off".into() },
+            GsField::Mangoapp => if f.mangoapp { "on".into() } else { "off".into() },
+            GsField::Mode => f.mode.label().to_string(),
+            GsField::Filter => f.filter.map(|x| x.label().to_string()).unwrap_or_else(|| "off".into()),
+            _ => {
+                let p = f.prompt(*field).expect("text field has a prompt");
+                if picked {
+                    // Track the cursor in the focused text field.
+                    let field_w = value_w.saturating_sub(1).max(1) as usize;
+                    let chars: Vec<char> = p.value.chars().collect();
+                    let start = p.cursor.saturating_sub(field_w.saturating_sub(1));
+                    let end = (start + field_w).min(chars.len());
+                    cursor = Some((value_x + (p.cursor - start) as u16, i as u16));
+                    chars[start.min(end)..end].iter().collect()
+                } else if p.value.is_empty() {
+                    "—".into()
+                } else {
+                    ellipsize(&p.value, value_w as usize)
+                }
+            }
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled(
+                if picked { " ▌" } else { "  " },
+                Style::default().fg(theme::ACCENT),
+            ),
+            Span::styled(
+                format!("{:<w$}", field.label(), w = LABEL_W as usize),
+                label_style,
+            ),
+            Span::styled(
+                format!("{:<w$}", value, w = value_w.max(1) as usize),
+                value_style,
+            ),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        format!("  {}", f.focused().help()),
+        Style::default().fg(theme::DIM),
+    )));
+
+    if crate::runners::which("gamescope").is_none() {
+        lines.push(Line::from(Span::styled(
+            "  ⚠ gamescope is not on $PATH — this will not launch until it is installed",
+            Style::default().fg(theme::WARN),
+        )));
+    }
+
+    // Live preview of what the wrapper will actually run.
+    lines.push(Line::from(""));
+    match f.build() {
+        Ok(cfg) => {
+            let argv = if cfg.enabled {
+                format!("gamescope {} -- …", cfg.args().join(" "))
+            } else {
+                "(the runner is launched directly)".to_string()
+            };
+            lines.push(Line::from(Span::styled(
+                "  command",
+                Style::default().fg(theme::DIM),
+            )));
+            for chunk in argv
+                .chars()
+                .collect::<Vec<_>>()
+                .chunks(inner.width.saturating_sub(4).max(1) as usize)
+            {
+                lines.push(Line::from(Span::styled(
+                    format!("   {}", chunk.iter().collect::<String>()),
+                    Style::default().fg(theme::FAINT),
+                )));
+            }
+        }
+        Err(e) => lines.push(Line::from(Span::styled(
+            format!("  ✗ {}", e),
+            Style::default().fg(theme::BAD).add_modifier(Modifier::BOLD),
+        ))),
+    }
+    if let Some(err) = &f.error {
+        lines.push(Line::from(Span::styled(
+            format!("  ✗ {}", err),
+            Style::default().fg(theme::BAD).add_modifier(Modifier::BOLD),
+        )));
+    }
+
+    lines.push(footer("↑/↓ field   space toggle   ↵ save   Esc cancel"));
+    frame.render_widget(Paragraph::new(lines), inner);
+
+    if let Some((cx, cy)) = cursor {
+        frame.set_cursor_position((
+            (inner.x + cx).min(inner.right().saturating_sub(1)),
+            inner.y + cy,
+        ));
+    }
+    let _ = app;
 }
 
 // -------------------------------------------------------------------- log ---
@@ -931,6 +1073,7 @@ fn step_confirm(frame: &mut Frame, area: Rect, app: &App, w: &AddWizard) {
             working_dir: None,
             tags: Vec::new(),
             notes: String::new(),
+            gamescope: Gamescope::default(),
             added: chrono::Utc::now(),
             last_played: None,
             playtime_secs: 0,

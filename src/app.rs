@@ -283,6 +283,159 @@ impl AddWizard {
     }
 }
 
+/// The gamescope editor. Text fields keep their own buffers so a half-typed
+/// resolution never has to round-trip through the config.
+#[derive(Debug)]
+pub struct GsForm {
+    pub game_id: String,
+    pub game_name: String,
+    pub enabled: bool,
+    pub output: Prompt,
+    pub game_res: Prompt,
+    pub mode: WindowMode,
+    pub fps: Prompt,
+    pub filter: Option<Filter>,
+    pub mangoapp: bool,
+    pub extra: Prompt,
+    pub field: usize,
+    pub error: Option<String>,
+}
+
+/// The editor's rows, in order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GsField {
+    Enabled,
+    Output,
+    GameRes,
+    Mode,
+    Fps,
+    Filter,
+    Mangoapp,
+    Extra,
+}
+
+impl GsField {
+    pub const ALL: [GsField; 8] = [
+        GsField::Enabled,
+        GsField::Output,
+        GsField::GameRes,
+        GsField::Mode,
+        GsField::Fps,
+        GsField::Filter,
+        GsField::Mangoapp,
+        GsField::Extra,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            GsField::Enabled => "gamescope",
+            GsField::Output => "output res",
+            GsField::GameRes => "game res",
+            GsField::Mode => "window",
+            GsField::Fps => "fps cap",
+            GsField::Filter => "upscaler",
+            GsField::Mangoapp => "mangoapp",
+            GsField::Extra => "extra args",
+        }
+    }
+
+    pub fn help(self) -> &'static str {
+        match self {
+            GsField::Enabled => "run the game inside gamescope",
+            GsField::Output => "-W/-H · what gamescope presents · blank = native",
+            GsField::GameRes => "-w/-h · what the game renders at · blank = same",
+            GsField::Mode => "-f / -b / nothing",
+            GsField::Fps => "-r · blank = uncapped",
+            GsField::Filter => "-F · upscaler used when the two resolutions differ",
+            GsField::Mangoapp => "--mangoapp · the mangohud overlay",
+            GsField::Extra => "passed through verbatim, split on spaces",
+        }
+    }
+
+    /// Text fields swallow typing; the others answer to space and the arrows.
+    pub fn is_text(self) -> bool {
+        matches!(self, GsField::Output | GsField::GameRes | GsField::Fps | GsField::Extra)
+    }
+}
+
+impl GsForm {
+    pub fn new(game: &Game) -> GsForm {
+        let gs = &game.gamescope;
+        GsForm {
+            game_id: game.id.clone(),
+            game_name: game.name.clone(),
+            enabled: gs.enabled,
+            output: Prompt::new("", &format_resolution(gs.output)),
+            game_res: Prompt::new("", &format_resolution(gs.game)),
+            mode: gs.mode,
+            fps: Prompt::new("", &gs.fps_limit.map(|f| f.to_string()).unwrap_or_default()),
+            filter: gs.filter,
+            mangoapp: gs.mangoapp,
+            extra: Prompt::new("", &gs.extra.join(" ")),
+            field: 0,
+            error: None,
+        }
+    }
+
+    pub fn focused(&self) -> GsField {
+        GsField::ALL[self.field.min(GsField::ALL.len() - 1)]
+    }
+
+    pub fn prompt(&self, field: GsField) -> Option<&Prompt> {
+        match field {
+            GsField::Output => Some(&self.output),
+            GsField::GameRes => Some(&self.game_res),
+            GsField::Fps => Some(&self.fps),
+            GsField::Extra => Some(&self.extra),
+            _ => None,
+        }
+    }
+
+    fn prompt_mut(&mut self, field: GsField) -> Option<&mut Prompt> {
+        match field {
+            GsField::Output => Some(&mut self.output),
+            GsField::GameRes => Some(&mut self.game_res),
+            GsField::Fps => Some(&mut self.fps),
+            GsField::Extra => Some(&mut self.extra),
+            _ => None,
+        }
+    }
+
+    /// Validate the buffers into a config, or say what is wrong.
+    pub fn build(&self) -> Result<Gamescope, String> {
+        let output = parse_resolution(&self.output.value)?;
+        let game = parse_resolution(&self.game_res.value)?;
+        let fps_text = self.fps.value.trim();
+        let fps_limit = if fps_text.is_empty() {
+            None
+        } else {
+            Some(
+                fps_text
+                    .parse::<u32>()
+                    .map_err(|_| format!("\"{}\" is not a frame rate", fps_text))?,
+            )
+        };
+        if fps_limit == Some(0) {
+            return Err("an fps cap of 0 would stop the game dead".into());
+        }
+        Ok(Gamescope {
+            enabled: self.enabled,
+            output,
+            game,
+            mode: self.mode,
+            fps_limit,
+            filter: self.filter,
+            mangoapp: self.mangoapp,
+            extra: self
+                .extra
+                .value
+                .split_whitespace()
+                .map(str::to_string)
+                .collect(),
+        })
+    }
+}
+
 #[derive(Debug)]
 pub enum ConfirmAction {
     Delete(String),
@@ -295,6 +448,7 @@ pub enum Overlay {
     Add(Box<AddWizard>),
     Confirm { message: String, action: ConfirmAction },
     RunnerPick { game_id: String, idx: usize },
+    Gamescope(Box<GsForm>),
     Log { title: String, lines: Vec<String>, scroll: usize },
 }
 
@@ -734,6 +888,7 @@ impl App {
             working_dir: None,
             tags: Vec::new(),
             notes: String::new(),
+            gamescope: Gamescope::default(),
             added: Utc::now(),
             last_played: None,
             playtime_secs: 0,
@@ -823,6 +978,7 @@ impl App {
             KeyCode::Enter | KeyCode::Char('p') => self.play_selected(),
             KeyCode::Char('x') | KeyCode::Char('K') => self.kill_selected(),
             KeyCode::Char('o') => self.open_log(),
+            KeyCode::Char('w') => self.open_gamescope(),
             KeyCode::Char('C') => self.run_winecfg(),
             KeyCode::Char('s') => {
                 self.sort = self.sort.next();
@@ -1004,6 +1160,7 @@ impl App {
             "kill" | "stop" => self.kill_selected(),
             "log" => self.open_log(),
             "winecfg" => self.run_winecfg(),
+            "gs" | "gamescope" => self.open_gamescope(),
             "runner" => {
                 if let Some(g) = self.selected() {
                     let id = g.id.clone();
@@ -1114,6 +1271,7 @@ impl App {
                 }
                 _ => self.mode = Mode::Overlay(Overlay::RunnerPick { game_id, idx }),
             },
+            Overlay::Gamescope(f) => self.key_gamescope(key, f),
             Overlay::Add(w) => self.key_add(key, w),
         }
     }
@@ -1465,6 +1623,100 @@ impl App {
             },
         }
         self.mode = Mode::Overlay(Overlay::Add(w));
+    }
+
+    fn key_gamescope(&mut self, key: KeyEvent, mut f: Box<GsForm>) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let focused = f.focused();
+        f.error = None;
+        match key.code {
+            KeyCode::Esc => return, // discard the edits
+            KeyCode::Enter => match f.build() {
+                Ok(cfg) => {
+                    let (id, name, summary) = (f.game_id.clone(), f.game_name.clone(), cfg.summary());
+                    if let Some(g) = self.game_mut(&id) {
+                        g.gamescope = cfg;
+                    }
+                    let _ = self.lib.save();
+                    self.note(format!("{}: gamescope {}", name, summary));
+                    return;
+                }
+                Err(e) => f.error = Some(e),
+            },
+            KeyCode::Down | KeyCode::Tab => {
+                f.field = (f.field + 1) % GsField::ALL.len();
+            }
+            KeyCode::Up | KeyCode::BackTab => {
+                f.field = (f.field + GsField::ALL.len() - 1) % GsField::ALL.len();
+            }
+            // j/k also move, but only where they cannot be mistaken for typing.
+            KeyCode::Char('j') if !focused.is_text() => {
+                f.field = (f.field + 1) % GsField::ALL.len();
+            }
+            KeyCode::Char('k') if !focused.is_text() => {
+                f.field = (f.field + GsField::ALL.len() - 1) % GsField::ALL.len();
+            }
+            KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right => match focused {
+                GsField::Enabled => f.enabled = !f.enabled,
+                GsField::Mangoapp => f.mangoapp = !f.mangoapp,
+                GsField::Mode => f.mode = f.mode.next(),
+                GsField::Filter => f.filter = Filter::next(f.filter),
+                _ => {
+                    // A space is just a space inside a text field.
+                    if key.code == KeyCode::Char(' ') {
+                        if let Some(p) = f.prompt_mut(focused) {
+                            p.insert(' ');
+                        }
+                    } else if let Some(p) = f.prompt_mut(focused) {
+                        if key.code == KeyCode::Left {
+                            p.left();
+                        } else {
+                            p.right();
+                        }
+                    }
+                }
+            },
+            KeyCode::Char('u') if ctrl => {
+                if let Some(p) = f.prompt_mut(focused) {
+                    p.kill();
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(p) = f.prompt_mut(focused) {
+                    p.backspace();
+                }
+            }
+            KeyCode::Home => {
+                if let Some(p) = f.prompt_mut(focused) {
+                    p.home();
+                }
+            }
+            KeyCode::End => {
+                if let Some(p) = f.prompt_mut(focused) {
+                    p.end();
+                }
+            }
+            KeyCode::Char(_) if ctrl => {}
+            KeyCode::Char(c) => {
+                if let Some(p) = f.prompt_mut(focused) {
+                    p.insert(c);
+                }
+            }
+            _ => {}
+        }
+        self.mode = Mode::Overlay(Overlay::Gamescope(f));
+    }
+
+    fn open_gamescope(&mut self) {
+        let Some(game) = self.selected() else {
+            self.fail("no game selected");
+            return;
+        };
+        let form = GsForm::new(game);
+        if runners::which("gamescope").is_none() {
+            self.fail("gamescope is not on $PATH — settings will be saved but cannot run");
+        }
+        self.mode = Mode::Overlay(Overlay::Gamescope(Box::new(form)));
     }
 
     /// Kick off the installer described by the wizard.

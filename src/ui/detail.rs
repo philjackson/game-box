@@ -137,6 +137,16 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         runner_span,
     ]));
 
+    let gs_style = if game.gamescope.enabled {
+        Style::default().fg(theme::HILITE)
+    } else {
+        Style::default().fg(theme::DIM)
+    };
+    lines.push(Line::from(vec![
+        Span::styled(format!(" {:<11}", "gamescope"), Style::default().fg(theme::DIM)),
+        Span::styled(game.gamescope.summary(), gs_style),
+    ]));
+
     // --- disk usage, scaled against the biggest game in the library ----
     let biggest = app
         .lib
