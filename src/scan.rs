@@ -1,6 +1,6 @@
 //! Inspecting a directory on disk: is it a wine prefix, and what can we launch?
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use walkdir::WalkDir;
 
@@ -290,6 +290,38 @@ pub fn is_windows_exe(p: &Path) -> bool {
             .unwrap_or(false)
 }
 
+/// A path the user typed, ready to be stored or handed to a child process:
+/// `~` expanded and the whole thing made absolute.
+pub fn user_path(input: &str) -> PathBuf {
+    absolute(&expand_tilde(input))
+}
+
+/// Make a path absolute without requiring it to exist, folding away `.` and
+/// `..` rather than resolving symlinks.
+///
+/// A relative path cannot survive the trip into a runner: we hand wine and
+/// proton both a working directory and a prefix, and they resolve the second
+/// against the first — so `Games/x` becomes `Games/x/Games/x` and the launch
+/// fails somewhere far away from the prompt that accepted it.
+pub fn absolute(path: &Path) -> PathBuf {
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")).join(path)
+    };
+    let mut out = PathBuf::new();
+    for part in joined.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 pub fn expand_tilde(input: &str) -> PathBuf {
     if let Some(rest) = input.strip_prefix("~/") {
         dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")).join(rest)
@@ -371,6 +403,22 @@ mod tests {
 
         assert!(!is_prefix(&game));
         assert_eq!(find_prefix(&game), Some(pfx));
+    }
+
+    /// The bug this guards: a relative prefix is resolved a second time by
+    /// the runner, against the working directory we just gave it.
+    #[test]
+    fn user_paths_come_back_absolute() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(user_path("Games/x"), cwd.join("Games/x"));
+        assert_eq!(user_path("./Games/./x"), cwd.join("Games/x"));
+        assert_eq!(user_path("Games/y/../x"), cwd.join("Games/x"));
+        assert_eq!(user_path("/opt/games/x"), PathBuf::from("/opt/games/x"));
+        assert_eq!(user_path("~/Games/x"), dirs::home_dir().unwrap().join("Games/x"));
+        // Absolute already, and no existence check anywhere.
+        assert!(user_path("/nowhere/at/all").is_absolute());
+        // `..` never climbs above the root.
+        assert_eq!(user_path("/../../x"), PathBuf::from("/x"));
     }
 
     #[test]

@@ -180,6 +180,11 @@ impl InstallJob {
         runner: Runner,
         arch: Arch,
     ) -> InstallJob {
+        // wine rejects a relative WINEPREFIX outright and proton resolves it
+        // against the working directory we hand the child, so neither may
+        // ever see one.
+        let dest = crate::scan::absolute(&dest);
+        let installer = installer.map(|i| crate::scan::absolute(&i));
         let prefix = Self::prefix_for(&dest, &runner);
         let log = library::log_dir().join(format!(
             "{}-{}.log",

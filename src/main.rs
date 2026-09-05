@@ -37,7 +37,7 @@ fn main() -> Result<()> {
                 eprintln!("usage: gbox --scan <directory>");
                 std::process::exit(2);
             };
-            let path = scan::expand_tilde(dir);
+            let path = scan::user_path(dir);
             let result = scan::scan_dir(&path, 8, 20);
             println!("prefix: {:?}", result.prefix);
             println!("built by: {:?}", result.runner_hint);

@@ -879,11 +879,12 @@ impl App {
     /// Commit a finished wizard to the library.
     pub fn add_from_wizard(&mut self, w: &AddWizard) -> Result<(), String> {
         let scan = w.scan.as_ref().ok_or("nothing scanned")?;
-        let exe = w.chosen_exe().ok_or("no executable chosen")?;
-        let prefix = scan
-            .prefix
-            .clone()
-            .ok_or("no wine prefix found for that directory")?;
+        // Absolute, always: these are handed to a runner that has its own
+        // working directory, and they outlive this process in library.json.
+        let exe = scan::absolute(&w.chosen_exe().ok_or("no executable chosen")?);
+        let prefix = scan::absolute(
+            scan.prefix.as_ref().ok_or("no wine prefix found for that directory")?,
+        );
         let runner = self
             .runners
             .get(w.runner_idx)
@@ -1408,7 +1409,7 @@ impl App {
             // -- source: a directory that already holds the game -----------
             AddStep::Path => match key.code {
                 KeyCode::Enter => {
-                    let path = scan::expand_tilde(w.prompt.value.trim());
+                    let path = scan::user_path(w.prompt.value.trim());
                     if !path.is_dir() {
                         w.error = Some(format!("{} is not a directory", path.display()));
                     } else {
@@ -1432,7 +1433,7 @@ impl App {
             // -- source: run an installer ----------------------------------
             AddStep::Installer => match key.code {
                 KeyCode::Enter => {
-                    let path = scan::expand_tilde(w.prompt.value.trim());
+                    let path = scan::user_path(w.prompt.value.trim());
                     if !scan::is_windows_exe(&path) {
                         w.error = Some(format!("{} is not an .exe or .msi", path.display()));
                     } else {
@@ -1461,7 +1462,7 @@ impl App {
 
             AddStep::Dest => match key.code {
                 KeyCode::Enter => {
-                    let path = scan::expand_tilde(w.prompt.value.trim());
+                    let path = scan::user_path(w.prompt.value.trim());
                     if path.as_os_str().is_empty() {
                         w.error = Some("give the new prefix a directory".into());
                     } else if path.is_file() {
