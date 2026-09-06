@@ -22,6 +22,9 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         Overlay::Confirm { message, .. } => confirm(frame, area, message),
         Overlay::RunnerPick { idx, .. } => runner_pick(frame, app, area, *idx),
         Overlay::Gamescope(f) => gamescope(frame, app, area, f),
+        Overlay::ExePick { game_name, scan, idx, .. } => {
+            exe_pick(frame, app, area, game_name, scan.as_ref(), *idx)
+        }
         Overlay::Log { title, lines, scroll } => log(frame, area, title, lines, *scroll),
     }
 }
@@ -71,6 +74,7 @@ fn help(frame: &mut Frame, area: Rect, scroll: u16) {
     row(&mut lines, "Enter / p", "play the selected game");
     row(&mut lines, "x", "terminate the running game");
     row(&mut lines, "R", "change the wine/proton runner");
+    row(&mut lines, "e", "change which executable a game launches");
     row(&mut lines, "w", "gamescope settings for this game");
     row(&mut lines, "C", "open winecfg on the prefix");
     row(&mut lines, "o", "read the last launch log");
@@ -93,6 +97,7 @@ fn help(frame: &mut Frame, area: Rect, scroll: u16) {
     row(&mut lines, ":log", "launch log");
     row(&mut lines, ":winecfg", "winecfg on the prefix");
     row(&mut lines, ":gamescope", "gamescope settings (also :gs)");
+    row(&mut lines, ":exe", "change the executable");
     row(&mut lines, ":q", "quit");
 
     section(&mut lines, "flags in the index");
@@ -321,6 +326,83 @@ fn gamescope(frame: &mut Frame, app: &App, area: Rect, f: &GsForm) {
     let _ = app;
 }
 
+// ------------------------------------------------------ executable picker ---
+
+fn exe_pick(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+    game_name: &str,
+    scan: Option<&crate::scan::ScanResult>,
+    idx: usize,
+) {
+    let area = centered(80, 70, area);
+    let inner = panel(frame, area, &format!("executable · {}", ellipsize(game_name, 24)));
+
+    let Some(scan) = scan else {
+        const FRAMES: [&str; 8] = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled(
+                        format!(" {} ", FRAMES[(app.tick / 2) as usize % FRAMES.len()]),
+                        Style::default().fg(theme::ACCENT),
+                    ),
+                    Span::styled(
+                        "scanning the prefix for executables…",
+                        Style::default().fg(theme::FG),
+                    ),
+                ]),
+            ]),
+            inner,
+        );
+        return;
+    };
+
+    let current = app.selected().map(|g| g.exe.clone());
+    let mut lines: Vec<Line> = vec![Line::from(Span::styled(
+        format!(
+            " {} candidate executables, best guess first:",
+            scan.candidates.len()
+        ),
+        Style::default().fg(theme::DIM),
+    ))];
+
+    let body = inner.height.saturating_sub(3) as usize;
+    let start = idx.saturating_sub(body.saturating_sub(1)).min(
+        scan.candidates.len().saturating_sub(body.min(scan.candidates.len())),
+    );
+    for (i, c) in scan.candidates.iter().enumerate().skip(start).take(body) {
+        let picked = i == idx;
+        let in_use = current.as_deref() == Some(c.path.as_path());
+        let style = if picked { theme::selected() } else { Style::default().fg(theme::FG) };
+        let sub = if picked { style } else { Style::default().fg(theme::DIM) };
+        let path_w = inner.width.saturating_sub(16) as usize;
+        lines.push(Line::from(vec![
+            Span::styled(if picked { "▌" } else { " " }, Style::default().fg(theme::ACCENT)),
+            // Mark the one in use, so a re-pick shows what it is replacing.
+            Span::styled(
+                if in_use { "● " } else { "  " },
+                if picked { style } else { Style::default().fg(theme::GOOD) },
+            ),
+            Span::styled(
+                format!("{:<w$}", ellipsize_left(&c.rel, path_w), w = path_w),
+                style,
+            ),
+            Span::styled(format!("{:>8}", human_size(c.size)), sub),
+        ]));
+    }
+    if scan.candidates.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  nothing launchable found under the prefix",
+            Style::default().fg(theme::BAD),
+        )));
+    }
+    lines.push(footer("j/k choose   ↵ use it   Esc cancel"));
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 // -------------------------------------------------------------------- log ---
 
 fn log(frame: &mut Frame, area: Rect, title: &str, lines: &[String], scroll: usize) {
@@ -430,7 +512,7 @@ fn add(frame: &mut Frame, app: &App, area: Rect, w: &AddWizard) {
         }
         AddStep::Arch => "space toggle   ↵ start installing   ⌫ back   Esc cancel",
         AddStep::Installing if installing_live => "x cancel   o full log   Esc leave it running",
-        AddStep::Installing => "↵ scan the prefix   o full log   Esc close",
+        AddStep::Installing => "↵ scan the prefix by hand   o full log   Esc close",
         AddStep::Scanning => "Esc cancel",
         AddStep::Exe => "j/k choose   ↵ next   ⌫ back   Esc cancel",
         AddStep::Runner => "j/k choose   ↵ next   ⌫ back   Esc cancel",

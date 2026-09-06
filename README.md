@@ -62,8 +62,9 @@ shows the phase, elapsed time and a live tail of the wine log.
   because wine processes leave our process group behind.
 - `Esc` leaves the install running in the background — the header keeps showing
   it, and `a`/`i` drops you back into the live view.
-- When it finishes, game-box rescans the new prefix and you pick the installed
-  game's executable exactly as above.
+- When it finishes, game-box scans the new prefix and adds the game to the
+  library on its own — no further steps. It says which executable it picked
+  and how many it chose between; `e` re-picks if the guess was wrong.
 
 Same escalation applies to a running game: `x` asks it to quit, a second `x`
 takes the whole prefix down through its wineserver.
@@ -90,7 +91,7 @@ silently running without it.
 ## Keys
 
 `j`/`k` move · `Enter` play · `x` kill · `a` add · `i` install · `R` runner ·
-`w` gamescope · `C` winecfg ·
+`e` executable · `w` gamescope · `C` winecfg ·
 `o` log · `d` remove · `/` search · `s` sort · `b`/`v` panes · `:` command ·
 `?` full help · `q` quit.
 

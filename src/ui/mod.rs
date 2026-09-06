@@ -455,6 +455,7 @@ fn hints() -> Line<'static> {
         ("↵", "play"),
         ("x", "kill"),
         ("R", "runner"),
+        ("e", "exe"),
         ("w", "gamescope"),
         ("o", "log"),
         ("d", "remove"),

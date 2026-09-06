@@ -328,6 +328,13 @@ impl Worker {
                     self.set(Phase::Cancelled);
                 } else {
                     self.say(&format!("\n# installer exited with status {}\n", code));
+                    // The installer's helpers outlive it and the prefix is not
+                    // final until the wineserver has gone. Registration reads
+                    // the destination the instant we say Done, so settle first
+                    // — otherwise a fast installer is registered against a
+                    // half-written prefix. The verdict is the installer's, not
+                    // settle's: plenty of installs are useful without one.
+                    self.settle();
                     self.set(Phase::Done { code });
                 }
             }

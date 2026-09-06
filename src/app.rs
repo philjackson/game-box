@@ -454,6 +454,15 @@ impl GsForm {
     }
 }
 
+/// The background scan of a finished install's destination, plus everything
+/// needed to turn its best candidate into a library entry.
+#[derive(Debug)]
+struct PendingRegister {
+    name: String,
+    runner: RunnerRef,
+    rx: Receiver<ScanResult>,
+}
+
 #[derive(Debug)]
 pub enum ConfirmAction {
     Delete(String),
@@ -466,6 +475,13 @@ pub enum Overlay {
     Add(Box<AddWizard>),
     Confirm { message: String, action: ConfirmAction },
     RunnerPick { game_id: String, idx: usize },
+    ExePick {
+        game_id: String,
+        game_name: String,
+        scan: Option<ScanResult>,
+        rx: Option<Receiver<ScanResult>>,
+        idx: usize,
+    },
     Gamescope(Box<GsForm>),
     Log { title: String, lines: Vec<String>, scroll: usize },
 }
@@ -517,6 +533,8 @@ pub struct App {
     pub display: crate::display::Display,
     pub install: Option<crate::install::InstallJob>,
     install_announced: bool,
+    /// A finished install being turned into a library entry without asking.
+    register: Option<PendingRegister>,
     size_rx: Option<Receiver<(String, u64)>>,
 }
 
@@ -549,6 +567,7 @@ impl App {
             display: crate::display::detect(),
             install: None,
             install_announced: false,
+            register: None,
             size_rx: None,
         };
         app.rebuild_collections();
@@ -738,7 +757,14 @@ impl App {
                     crate::install::JobKind::Prefix => "pick the game's executable",
                 };
                 self.install_announced = true;
+                let installed = matches!(job.kind, crate::install::JobKind::Install(_));
                 match phase {
+                    // An install that finished has done its job only once the
+                    // game is in the library, so finish it without asking.
+                    crate::install::Phase::Done { .. } if installed => {
+                        self.note(format!("{} — adding it to the library", label));
+                        self.begin_auto_register();
+                    }
                     crate::install::Phase::Done { code: 0 } => {
                         self.note(format!("{} — press 'a' to {}", label, next))
                     }
@@ -750,6 +776,9 @@ impl App {
                 }
             }
         }
+
+        self.poll_register();
+        self.poll_exe_pick();
 
         // Sample the running games, then reap the ones that exited.
         let live: Vec<(String, u32)> =
@@ -908,16 +937,31 @@ impl App {
         } else {
             w.name.trim().to_string()
         };
+        let runner = RunnerRef::of(runner);
+        self.insert_game(&name, exe, prefix, runner)?;
+        self.note(format!("added {}", name));
+        Ok(())
+    }
+
+    /// Put a game in the library, save, and select it. The one place an entry
+    /// is created, so the wizard and a finished install cannot drift apart.
+    fn insert_game(
+        &mut self,
+        name: &str,
+        exe: PathBuf,
+        prefix: PathBuf,
+        runner: RunnerRef,
+    ) -> Result<String, String> {
         if self.lib.games.iter().any(|g| g.exe == exe) {
             return Err("that executable is already in the library".into());
         }
-        let id = self.lib.unique_id(&slugify(&name));
-        let game = Game {
+        let id = self.lib.unique_id(&slugify(name));
+        self.lib.games.push(Game {
             id: id.clone(),
-            name: name.clone(),
+            name: name.to_string(),
             exe,
             prefix,
-            runner: RunnerRef::of(runner),
+            runner,
             args: Vec::new(),
             env: Default::default(),
             working_dir: None,
@@ -929,8 +973,7 @@ impl App {
             playtime_secs: 0,
             sessions: Vec::new(),
             size_bytes: None,
-        };
-        self.lib.games.push(game);
+        });
         self.lib.save().map_err(|e| e.to_string())?;
         self.rebuild_collections();
         self.refresh_view();
@@ -938,8 +981,7 @@ impl App {
         if let Some(pos) = self.view.iter().position(|&i| self.lib.games[i].id == id) {
             self.cursor = pos;
         }
-        self.note(format!("added {}", name));
-        Ok(())
+        Ok(id)
     }
 
     // ---- input ------------------------------------------------------------
@@ -1017,6 +1059,7 @@ impl App {
             KeyCode::Char('x') | KeyCode::Char('K') => self.kill_selected(),
             KeyCode::Char('o') => self.open_log(),
             KeyCode::Char('w') => self.open_gamescope(),
+            KeyCode::Char('e') => self.open_exe_pick(),
             KeyCode::Char('C') => self.run_winecfg(),
             KeyCode::Char('s') => {
                 self.sort = self.sort.next();
@@ -1200,6 +1243,7 @@ impl App {
             "log" => self.open_log(),
             "winecfg" => self.run_winecfg(),
             "gs" | "gamescope" => self.open_gamescope(),
+            "exe" | "executable" => self.open_exe_pick(),
             "runner" => {
                 if let Some(g) = self.selected() {
                     let id = g.id.clone();
@@ -1311,6 +1355,44 @@ impl App {
                 _ => self.mode = Mode::Overlay(Overlay::RunnerPick { game_id, idx }),
             },
             Overlay::Gamescope(f) => self.key_gamescope(key, f),
+            Overlay::ExePick { game_id, game_name, scan, rx, mut idx } => {
+                let n = scan.as_ref().map(|s| s.candidates.len()).unwrap_or(0);
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => return,
+                    KeyCode::Enter => {
+                        let chosen = scan
+                            .as_ref()
+                            .and_then(|s| s.candidates.get(idx))
+                            .map(|c| crate::scan::absolute(&c.path));
+                        match chosen {
+                            Some(exe) => {
+                                if self.lib.games.iter().any(|g| g.exe == exe && g.id != game_id) {
+                                    self.fail("another game already uses that executable");
+                                } else {
+                                    if let Some(g) = self.game_mut(&game_id) {
+                                        g.exe = exe.clone();
+                                    }
+                                    let _ = self.lib.save();
+                                    self.refresh_view();
+                                    self.note(format!(
+                                        "{} now launches {}",
+                                        game_name,
+                                        exe.file_name().unwrap_or_default().to_string_lossy()
+                                    ));
+                                    return;
+                                }
+                            }
+                            None => self.fail("still scanning"),
+                        }
+                    }
+                    KeyCode::Char('j') | KeyCode::Down => idx = (idx + 1).min(n.saturating_sub(1)),
+                    KeyCode::Char('k') | KeyCode::Up => idx = idx.saturating_sub(1),
+                    KeyCode::Char('g') | KeyCode::Home => idx = 0,
+                    KeyCode::Char('G') | KeyCode::End => idx = n.saturating_sub(1),
+                    _ => {}
+                }
+                self.mode = Mode::Overlay(Overlay::ExePick { game_id, game_name, scan, rx, idx });
+            }
             Overlay::Add(w) => self.key_add(key, w),
         }
     }
@@ -1764,11 +1846,94 @@ impl App {
         self.mode = Mode::Overlay(Overlay::Gamescope(Box::new(form)));
     }
 
+    /// Re-pick a game's executable. An auto-registered install guesses, and a
+    /// repack can hide the real entry point behind a launcher, so the guess
+    /// has to be correctable without deleting the entry.
+    fn open_exe_pick(&mut self) {
+        let Some(game) = self.selected() else {
+            self.fail("no game selected");
+            return;
+        };
+        let (game_id, game_name) = (game.id.clone(), game.name.clone());
+        // The compat directory, so a game living beside its prefix is seen too.
+        let root = game.compat_data_path();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(scan::scan_dir(&root, 8, 60));
+        });
+        self.mode = Mode::Overlay(Overlay::ExePick {
+            game_id,
+            game_name,
+            scan: None,
+            rx: Some(rx),
+            idx: 0,
+        });
+    }
+
     /// A job worth dropping back into: still running, or finished and not
     /// yet registered. Every way into the wizard rejoins it rather than
     /// starting over.
     fn resumable_job(&self) -> Option<&crate::install::InstallJob> {
         self.install.as_ref().filter(|j| j.is_live() || j.succeeded())
+    }
+
+    /// Scan a finished install's destination in the background.
+    fn begin_auto_register(&mut self) {
+        let Some(job) = &self.install else { return };
+        let dest = job.dest.clone();
+        let name = titleize(&dest.file_name().unwrap_or_default().to_string_lossy());
+        let runner = RunnerRef { kind: job.runner.kind, name: job.runner.name.clone() };
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(scan::scan_dir(&dest, 8, 60));
+        });
+        self.register = Some(PendingRegister { name, runner, rx });
+    }
+
+    /// Turn that scan into a library entry. Called every tick.
+    fn poll_register(&mut self) {
+        let Some(pending) = &self.register else { return };
+        let Ok(result) = pending.rx.try_recv() else { return };
+        let Some(pending) = self.register.take() else { return };
+
+        let Some(prefix) = result.prefix.clone() else {
+            self.fail(format!(
+                "installed, but {} holds no wine prefix — press 'a' to add it by hand",
+                result.root.display()
+            ));
+            return;
+        };
+        let Some(best) = result.candidates.first() else {
+            self.fail("installed, but no launchable .exe turned up — press 'a' to add it by hand");
+            return;
+        };
+
+        let exe = scan::absolute(&best.path);
+        let rel = best.rel.clone();
+        let count = result.candidates.len();
+        match self.insert_game(&pending.name, exe, scan::absolute(&prefix), pending.runner) {
+            Ok(_) => {
+                // Always say which executable was chosen: the guess is usually
+                // right, but the user should never have to wonder.
+                let mut msg = format!("added {} — {}", pending.name, rel);
+                if count > 1 {
+                    msg.push_str(&format!(" (best of {}, 'e' to change)", count));
+                }
+                self.note(msg);
+                self.install = None;
+                self.close_install_wizard();
+            }
+            Err(e) => self.fail(format!("installed, but not added: {}", e)),
+        }
+    }
+
+    /// Drop the wizard overlay if it is still sitting on the finished install.
+    fn close_install_wizard(&mut self) {
+        if let Mode::Overlay(Overlay::Add(w)) = &self.mode {
+            if w.step == AddStep::Installing {
+                self.mode = Mode::Normal;
+            }
+        }
     }
 
     /// Kick off the background job the wizard describes: an install into a
@@ -1793,7 +1958,30 @@ impl App {
         };
         self.install = Some(job);
         self.install_announced = false;
+        self.register = None;
         Ok(())
+    }
+
+    /// Pump the executable picker's background scan; called every tick.
+    fn poll_exe_pick(&mut self) {
+        let Mode::Overlay(Overlay::ExePick { game_id, scan, rx, idx, .. }) = &mut self.mode else {
+            return;
+        };
+        if scan.is_some() {
+            return;
+        }
+        let Some(chan) = rx else { return };
+        let Ok(result) = chan.try_recv() else { return };
+        *rx = None;
+        // Start on the executable the game already uses, so the list opens
+        // showing where it is rather than at whatever ranks first.
+        let current = self.lib.games.iter().find(|g| &g.id == game_id).map(|g| g.exe.clone());
+        if let Some(current) = current {
+            if let Some(pos) = result.candidates.iter().position(|c| c.path == current) {
+                *idx = pos;
+            }
+        }
+        *scan = Some(result);
     }
 
     /// Pump the wizard's background scan; called every tick.
