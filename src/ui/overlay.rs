@@ -8,7 +8,9 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use super::widgets::*;
-use crate::app::{AddSource, AddStep, AddWizard, App, GsField, GsForm, Mode, Overlay, Prompt};
+use crate::app::{
+    AddSource, AddStep, AddWizard, App, ArgsForm, GsField, GsForm, Mode, Overlay, Prompt,
+};
 use crate::install::{Arch, Phase};
 use crate::launch;
 use crate::model::*;
@@ -22,6 +24,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         Overlay::Confirm { message, .. } => confirm(frame, area, message),
         Overlay::RunnerPick { idx, .. } => runner_pick(frame, app, area, *idx),
         Overlay::Gamescope(f) => gamescope(frame, app, area, f),
+        Overlay::Args(f) => args(frame, app, area, f),
         Overlay::ExePick { game_name, scan, idx, .. } => {
             exe_pick(frame, app, area, game_name, scan.as_ref(), *idx)
         }
@@ -76,6 +79,7 @@ fn help(frame: &mut Frame, area: Rect, scroll: u16) {
     row(&mut lines, "R", "change the wine/proton runner");
     row(&mut lines, "e", "change which executable a game launches");
     row(&mut lines, "w", "gamescope settings for this game");
+    row(&mut lines, "A", "arguments passed to the game itself");
     row(&mut lines, "C", "open winecfg on the prefix");
     row(&mut lines, "o", "read the last launch log");
     row(&mut lines, "d", "remove from library (files stay)");
@@ -97,6 +101,7 @@ fn help(frame: &mut Frame, area: Rect, scroll: u16) {
     row(&mut lines, ":log", "launch log");
     row(&mut lines, ":winecfg", "winecfg on the prefix");
     row(&mut lines, ":gamescope", "gamescope settings (also :gs)");
+    row(&mut lines, ":args [a b]", "set launch arguments, or open the editor");
     row(&mut lines, ":exe", "change the executable");
     row(&mut lines, ":q", "quit");
 
@@ -323,6 +328,111 @@ fn gamescope(frame: &mut Frame, app: &App, area: Rect, f: &GsForm) {
             inner.y + cy,
         ));
     }
+    let _ = app;
+}
+
+// ---------------------------------------------------- launch arguments ---
+
+fn args(frame: &mut Frame, app: &App, area: Rect, f: &ArgsForm) {
+    let parsed = f.build();
+    // One row per argument, so the split is visible rather than guessed at.
+    // The box is sized to its contents: the field, two spacers, the help, the
+    // argv block, the footer and the borders — plus an error row when there
+    // is one.
+    let body = match &parsed {
+        Ok(argv) if argv.is_empty() => 1,
+        Ok(argv) => 1 + argv.len().min(8) + usize::from(argv.len() > 8),
+        Err(_) => 1,
+    } as u16;
+    let rows = 7 + body + u16::from(f.error.is_some());
+    let area = centered_fixed(78.min(area.width), rows.min(area.height), area);
+    let inner = panel(
+        frame,
+        area,
+        &format!("launch args · {}", ellipsize(&f.game_name, 24)),
+    );
+
+    // Same row geometry as the gamescope editor, so the cursor lands right.
+    const GUTTER_W: u16 = 2;
+    const LABEL_W: u16 = 12;
+    let value_x = GUTTER_W + LABEL_W;
+    let value_w = inner.width.saturating_sub(value_x + 1);
+
+    // Scroll the buffer so the caret stays inside the field.
+    let field_w = value_w.saturating_sub(1).max(1) as usize;
+    let chars: Vec<char> = f.prompt.value.chars().collect();
+    let start = f.prompt.cursor.saturating_sub(field_w.saturating_sub(1));
+    let end = (start + field_w).min(chars.len());
+    let shown: String = chars[start.min(end)..end].iter().collect();
+
+    let mut lines: Vec<Line> = vec![Line::from(vec![
+        Span::styled(" ▌", Style::default().fg(theme::ACCENT)),
+        Span::styled(
+            format!("{:<w$}", "arguments", w = LABEL_W as usize),
+            Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{:<w$}", shown, w = value_w.max(1) as usize),
+            theme::selected(),
+        ),
+    ])];
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  passed to the game after the .exe · quote a value that holds spaces",
+        Style::default().fg(theme::DIM),
+    )));
+    lines.push(Line::from(""));
+
+    match &parsed {
+        Ok(argv) if argv.is_empty() => lines.push(Line::from(Span::styled(
+            "  (none — the game is launched with no arguments)",
+            Style::default().fg(theme::FAINT),
+        ))),
+        Ok(argv) => {
+            lines.push(Line::from(Span::styled(
+                "  argv",
+                Style::default().fg(theme::DIM),
+            )));
+            for (i, a) in argv.iter().take(8).enumerate() {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("   {:>2}  ", i + 1),
+                        Style::default().fg(theme::FAINT),
+                    ),
+                    Span::styled(
+                        ellipsize(a, inner.width.saturating_sub(9) as usize),
+                        Style::default().fg(theme::FG),
+                    ),
+                ]));
+            }
+            if argv.len() > 8 {
+                lines.push(Line::from(Span::styled(
+                    format!("   … {} more", argv.len() - 8),
+                    Style::default().fg(theme::FAINT),
+                )));
+            }
+        }
+        Err(e) => lines.push(Line::from(Span::styled(
+            format!("  ✗ {}", e),
+            Style::default().fg(theme::BAD).add_modifier(Modifier::BOLD),
+        ))),
+    }
+
+    if let Some(err) = &f.error {
+        lines.push(Line::from(Span::styled(
+            format!("  ✗ {}", err),
+            Style::default().fg(theme::BAD).add_modifier(Modifier::BOLD),
+        )));
+    }
+
+    lines.push(footer("↵ save   Esc cancel"));
+    frame.render_widget(Paragraph::new(lines), inner);
+
+    frame.set_cursor_position((
+        (inner.x + value_x + (f.prompt.cursor - start) as u16).min(inner.right().saturating_sub(1)),
+        inner.y,
+    ));
     let _ = app;
 }
 

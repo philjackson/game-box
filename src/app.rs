@@ -454,6 +454,33 @@ impl GsForm {
     }
 }
 
+/// The launch-argument editor: one line of text, parsed into argv. Kept
+/// separate from the gamescope form because these go to the game, not to the
+/// wrapper around it.
+#[derive(Debug)]
+pub struct ArgsForm {
+    pub game_id: String,
+    pub game_name: String,
+    pub prompt: Prompt,
+    pub error: Option<String>,
+}
+
+impl ArgsForm {
+    pub fn new(game: &Game) -> ArgsForm {
+        ArgsForm {
+            game_id: game.id.clone(),
+            game_name: game.name.clone(),
+            prompt: Prompt::new("", &join_args(&game.args)),
+            error: None,
+        }
+    }
+
+    /// Validate the buffer into argv, or say what is wrong.
+    pub fn build(&self) -> Result<Vec<String>, String> {
+        parse_args(&self.prompt.value)
+    }
+}
+
 /// The background scan of a finished install's destination, plus everything
 /// needed to turn its best candidate into a library entry.
 #[derive(Debug)]
@@ -483,6 +510,7 @@ pub enum Overlay {
         idx: usize,
     },
     Gamescope(Box<GsForm>),
+    Args(Box<ArgsForm>),
     Log { title: String, lines: Vec<String>, scroll: usize },
 }
 
@@ -1059,6 +1087,7 @@ impl App {
             KeyCode::Char('x') | KeyCode::Char('K') => self.kill_selected(),
             KeyCode::Char('o') => self.open_log(),
             KeyCode::Char('w') => self.open_gamescope(),
+            KeyCode::Char('A') => self.open_args(),
             KeyCode::Char('e') => self.open_exe_pick(),
             KeyCode::Char('C') => self.run_winecfg(),
             KeyCode::Char('s') => {
@@ -1243,6 +1272,22 @@ impl App {
             "log" => self.open_log(),
             "winecfg" => self.run_winecfg(),
             "gs" | "gamescope" => self.open_gamescope(),
+            "args" => {
+                // Bare `:args` opens the editor; a rest sets them outright, so
+                // a known flag needs no round trip through the overlay.
+                if rest.is_empty() {
+                    self.open_args();
+                } else {
+                    match (parse_args(rest), self.selected_id()) {
+                        (Ok(args), Some(id)) => self.set_args(&id, args),
+                        (Ok(_), None) => self.fail("no game selected"),
+                        (Err(e), _) => {
+                            self.fail(e);
+                            return;
+                        }
+                    }
+                }
+            }
             "exe" | "executable" => self.open_exe_pick(),
             "runner" => {
                 if let Some(g) = self.selected() {
@@ -1355,6 +1400,7 @@ impl App {
                 _ => self.mode = Mode::Overlay(Overlay::RunnerPick { game_id, idx }),
             },
             Overlay::Gamescope(f) => self.key_gamescope(key, f),
+            Overlay::Args(f) => self.key_args(key, f),
             Overlay::ExePick { game_id, game_name, scan, rx, mut idx } => {
                 let n = scan.as_ref().map(|s| s.candidates.len()).unwrap_or(0);
                 match key.code {
@@ -1844,6 +1890,51 @@ impl App {
             self.fail("gamescope is not on $PATH — settings will be saved but cannot run");
         }
         self.mode = Mode::Overlay(Overlay::Gamescope(Box::new(form)));
+    }
+
+    fn key_args(&mut self, key: KeyEvent, mut f: Box<ArgsForm>) {
+        f.error = None;
+        match key.code {
+            KeyCode::Esc => return, // discard the edits
+            KeyCode::Enter => match f.build() {
+                Ok(args) => {
+                    let id = f.game_id.clone();
+                    self.set_args(&id, args);
+                    return;
+                }
+                Err(e) => f.error = Some(e),
+            },
+            _ => {
+                Self::prompt_key(&mut f.prompt, key);
+            }
+        }
+        self.mode = Mode::Overlay(Overlay::Args(f));
+    }
+
+    /// Arguments handed to the game itself, after the executable. Some games
+    /// only behave with one — a VR title needs its non-VR switch to come up on
+    /// a flat screen.
+    fn open_args(&mut self) {
+        let Some(game) = self.selected() else {
+            self.fail("no game selected");
+            return;
+        };
+        self.mode = Mode::Overlay(Overlay::Args(Box::new(ArgsForm::new(game))));
+    }
+
+    fn set_args(&mut self, id: &str, args: Vec<String>) {
+        let summary = if args.is_empty() {
+            "cleared".to_string()
+        } else {
+            join_args(&args)
+        };
+        let mut name = String::new();
+        if let Some(g) = self.game_mut(id) {
+            g.args = args;
+            name = g.name.clone();
+        }
+        let _ = self.lib.save();
+        self.note(format!("{}: launch args {}", name, summary));
     }
 
     /// Re-pick a game's executable. An auto-registered install guesses, and a

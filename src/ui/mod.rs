@@ -440,15 +440,18 @@ fn prompt_line(frame: &mut Frame, app: &App, area: Rect) {
                     return;
                 }
             }
-            frame.render_widget(Paragraph::new(hints()), area);
+            frame.render_widget(Paragraph::new(hints(area.width)), area);
         }
     }
 }
 
-fn hints() -> Line<'static> {
+/// The one-line key reminder. Narrow terminals get as many bindings as fit,
+/// in order, rather than a hint chopped off mid-word.
+fn hints(width: u16) -> Line<'static> {
     let key = Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD);
     let txt = Style::default().fg(theme::DIM);
     let mut spans = vec![Span::styled(" ", txt)];
+    let mut used = 1usize;
     for (k, label) in [
         ("a", "add"),
         ("i", "install"),
@@ -456,7 +459,8 @@ fn hints() -> Line<'static> {
         ("x", "kill"),
         ("R", "runner"),
         ("e", "exe"),
-        ("w", "gamescope"),
+        ("w", "gscope"),
+        ("A", "args"),
         ("o", "log"),
         ("d", "remove"),
         ("/", "search"),
@@ -464,6 +468,11 @@ fn hints() -> Line<'static> {
         ("?", "help"),
         ("q", "quit"),
     ] {
+        let cost = k.chars().count() + label.chars().count() + 3;
+        if used + cost > width as usize {
+            break;
+        }
+        used += cost;
         spans.push(Span::styled(k, key));
         spans.push(Span::styled(format!(":{}  ", label), txt));
     }

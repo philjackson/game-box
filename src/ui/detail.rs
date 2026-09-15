@@ -147,6 +147,10 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(game.gamescope.summary(), gs_style),
     ]));
 
+    if !game.args.is_empty() {
+        lines.push(field("args", join_args(&game.args)));
+    }
+
     // --- disk usage, scaled against the biggest game in the library ----
     let biggest = app
         .lib

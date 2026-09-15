@@ -239,6 +239,70 @@ pub fn format_resolution(res: Option<(u32, u32)>) -> String {
     res.map(|(w, h)| format!("{}x{}", w, h)).unwrap_or_default()
 }
 
+/// Split a typed line into argv entries. Quotes group a value that holds
+/// spaces, and a doubled quote inside a quoted run is a literal one. A
+/// backslash is never an escape: these arguments are windows paths far more
+/// often than they are shell words, so `C:\Games\x` has to survive intact.
+pub fn parse_args(line: &str) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    // Distinct from `cur.is_empty()`, so a deliberate "" stays an argument.
+    let mut started = false;
+    let mut quote: Option<char> = None;
+    let mut chars = line.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) if c == q => {
+                if chars.peek() == Some(&q) {
+                    chars.next();
+                    cur.push(q);
+                } else {
+                    quote = None;
+                }
+            }
+            Some(_) => cur.push(c),
+            None if c == '"' || c == '\'' => {
+                quote = Some(c);
+                started = true;
+            }
+            None if c.is_whitespace() => {
+                if started {
+                    out.push(std::mem::take(&mut cur));
+                    started = false;
+                }
+            }
+            None => {
+                cur.push(c);
+                started = true;
+            }
+        }
+    }
+
+    if let Some(q) = quote {
+        return Err(format!("unterminated {} quote", q));
+    }
+    if started {
+        out.push(cur);
+    }
+    Ok(out)
+}
+
+/// Render argv back into a line `parse_args` reads the same way.
+pub fn join_args(args: &[String]) -> String {
+    args.iter().map(|a| quote_arg(a)).collect::<Vec<_>>().join(" ")
+}
+
+fn quote_arg(a: &str) -> String {
+    let bare = !a.is_empty()
+        && !a.chars().any(|c| c.is_whitespace() || c == '"' || c == '\'');
+    if bare {
+        a.to_string()
+    } else {
+        format!("\"{}\"", a.replace('"', "\"\""))
+    }
+}
+
 /// One entry in the library.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Game {
@@ -429,6 +493,37 @@ mod tests {
         assert!(parse_resolution("0x1080").is_err());
         assert_eq!(format_resolution(Some((1280, 720))), "1280x720");
         assert_eq!(format_resolution(None), "");
+    }
+
+    #[test]
+    fn args_split_on_spaces_but_keep_quoted_paths_whole() {
+        assert_eq!(parse_args(""), Ok(vec![]));
+        assert_eq!(parse_args("  -NonVR  "), Ok(vec!["-NonVR".to_string()]));
+        assert_eq!(
+            parse_args(r#"-config "C:\My Docs\a.ini" -windowed"#),
+            Ok(vec![
+                "-config".to_string(),
+                r"C:\My Docs\a.ini".to_string(),
+                "-windowed".to_string(),
+            ])
+        );
+        // Backslashes are literal, so a windows path needs no doubling.
+        assert_eq!(parse_args(r"C:\Games\x"), Ok(vec![r"C:\Games\x".to_string()]));
+        // A doubled quote inside a quoted run is one literal quote.
+        assert_eq!(parse_args(r#""say ""hi""""#), Ok(vec![r#"say "hi""#.to_string()]));
+        assert!(parse_args(r#"-config "unclosed"#).is_err());
+    }
+
+    #[test]
+    fn joining_args_round_trips_through_the_parser() {
+        for argv in [
+            vec!["-NonVR".to_string()],
+            vec!["-config".to_string(), r"C:\My Docs\a.ini".to_string()],
+            vec![r#"it's "quoted""#.to_string(), String::new()],
+        ] {
+            assert_eq!(parse_args(&join_args(&argv)), Ok(argv));
+        }
+        assert_eq!(join_args(&[]), "");
     }
 
     #[test]
