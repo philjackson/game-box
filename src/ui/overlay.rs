@@ -82,7 +82,7 @@ fn help(frame: &mut Frame, area: Rect, scroll: u16) {
     row(&mut lines, "A", "arguments passed to the game itself");
     row(&mut lines, "C", "open winecfg on the prefix");
     row(&mut lines, "o", "read the last launch log");
-    row(&mut lines, "d", "remove from library (files stay)");
+    row(&mut lines, "d", "remove from library, then offer to delete its directory");
     row(&mut lines, "s / S", "cycle sort key / reverse");
     row(&mut lines, "$", "rescan runners and prefix sizes");
 
@@ -132,22 +132,23 @@ fn help(frame: &mut Frame, area: Rect, scroll: u16) {
 // --------------------------------------------------------------- confirm ---
 
 fn confirm(frame: &mut Frame, area: Rect, message: &str) {
-    let area = centered_fixed((message.chars().count() as u16 + 8).min(area.width), 7, area);
+    let rows: Vec<&str> = message.lines().collect();
+    let widest = rows.iter().map(|l| l.chars().count()).max().unwrap_or(0) as u16;
+    let area = centered_fixed((widest + 8).min(area.width), rows.len() as u16 + 6, area);
     let inner = panel(frame, area, "confirm");
-    let lines = vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            format!("  {}", message),
-            Style::default().fg(theme::FG),
-        )),
-        Line::from(""),
-        Line::from(vec![
+    let mut lines = vec![Line::from("")];
+    for (i, row) in rows.iter().enumerate() {
+        // The first line asks the question; the rest is supporting detail.
+        let style = if i == 0 { Style::default().fg(theme::FG) } else { Style::default().fg(theme::DIM) };
+        lines.push(Line::from(Span::styled(format!("  {}", row), style)));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
             Span::styled("  y", Style::default().fg(theme::GOOD).add_modifier(Modifier::BOLD)),
             Span::styled("es    ", Style::default().fg(theme::DIM)),
             Span::styled("n", Style::default().fg(theme::BAD).add_modifier(Modifier::BOLD)),
             Span::styled("o / Esc", Style::default().fg(theme::DIM)),
-        ]),
-    ];
+        ]));
     frame.render_widget(Paragraph::new(lines), inner);
 }
 

@@ -368,6 +368,20 @@ impl Game {
     pub fn exists(&self) -> bool {
         self.exe.is_file()
     }
+
+    /// The directory that *is* this game on disk: the prefix, or for proton's
+    /// `<dir>/pfx` layout the directory around it, since that is where the
+    /// installer wrote and where an added game's files sit beside the prefix.
+    pub fn root_dir(&self) -> PathBuf {
+        if self.prefix.file_name().map(|n| n == "pfx").unwrap_or(false) {
+            if let Some(parent) = self.prefix.parent() {
+                if !parent.as_os_str().is_empty() {
+                    return parent.to_path_buf();
+                }
+            }
+        }
+        self.prefix.clone()
+    }
 }
 
 /// Make a filesystem- and url-safe id out of a display name.
@@ -573,5 +587,31 @@ mod tests {
         // No pfx/ on disk in the test env, so it falls back to the prefix root.
         assert_eq!(g.compat_data_path(), PathBuf::from("/g/x"));
         assert_eq!(g.exe_dir(), PathBuf::from("/g/x"));
+        assert_eq!(g.root_dir(), PathBuf::from("/g/x"));
+    }
+
+    #[test]
+    fn root_dir_steps_out_of_protons_pfx() {
+        let mut g = Game {
+            id: "x".into(),
+            name: "x".into(),
+            exe: PathBuf::from("/g/x/x.exe"),
+            prefix: PathBuf::from("/g/x/pfx"),
+            runner: RunnerRef { kind: RunnerKind::Proton, name: "GE".into() },
+            args: vec![],
+            env: Default::default(),
+            working_dir: None,
+            tags: vec![],
+            notes: String::new(),
+            gamescope: Gamescope::default(),
+            added: Utc::now(),
+            last_played: None,
+            playtime_secs: 0,
+            sessions: vec![],
+            size_bytes: None,
+        };
+        assert_eq!(g.root_dir(), PathBuf::from("/g/x"));
+        g.prefix = PathBuf::from("/g/y");
+        assert_eq!(g.root_dir(), PathBuf::from("/g/y"));
     }
 }

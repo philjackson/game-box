@@ -1,7 +1,7 @@
 //! Application state and key handling.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 
 use anyhow::Result;
@@ -492,7 +492,10 @@ struct PendingRegister {
 
 #[derive(Debug)]
 pub enum ConfirmAction {
+    /// Drop a game from the library; may lead on to `DeleteFiles`.
     Delete(String),
+    /// `rm -rf` a directory a just-removed game lived in.
+    DeleteFiles(PathBuf),
     Quit,
 }
 
@@ -889,14 +892,70 @@ impl App {
         }
     }
 
+    /// Remove a game from the library, then offer to delete its directory too.
     pub fn delete(&mut self, id: &str) {
-        if let Some(pos) = self.lib.games.iter().position(|g| g.id == id) {
-            let name = self.lib.games[pos].name.clone();
-            self.lib.games.remove(pos);
-            let _ = self.lib.save();
-            self.rebuild_collections();
-            self.refresh_view();
-            self.note(format!("removed {} from the library (files untouched)", name));
+        let Some(pos) = self.lib.games.iter().position(|g| g.id == id) else { return };
+        if self.is_running(id) {
+            self.fail("that game is running — stop it first (x)");
+            return;
+        }
+        let game = self.lib.games.remove(pos);
+        let _ = self.lib.save();
+        self.rebuild_collections();
+        self.refresh_view();
+        match self.deletable_dir(&game) {
+            Some(dir) => {
+                let size = game
+                    .size_bytes
+                    .map(|b| format!(" ({})", human_size(b)))
+                    .unwrap_or_default();
+                self.mode = Mode::Overlay(Overlay::Confirm {
+                    message: format!(
+                        "Removed \"{}\" from the library.\nAlso delete its directory{}?\n{}\nThis removes the prefix and the game's files for good.",
+                        game.name,
+                        size,
+                        dir.display()
+                    ),
+                    action: ConfirmAction::DeleteFiles(dir),
+                });
+            }
+            None => self.note(format!("removed {} from the library (files untouched)", game.name)),
+        }
+    }
+
+    /// The directory it would be safe to offer deleting along with `game`:
+    /// its root, provided that root exists, is not somewhere absurd like
+    /// `$HOME`, and no other library entry keeps anything inside it.
+    fn deletable_dir(&self, game: &Game) -> Option<PathBuf> {
+        let dir = game.root_dir();
+        if !dir.is_dir() || dir.parent().is_none() {
+            return None;
+        }
+        // Refuse the filesystem root, `$HOME`, and anything directly under `/`.
+        if dir.components().count() < 3 {
+            return None;
+        }
+        if dirs::home_dir().map(|h| h == dir).unwrap_or(false) {
+            return None;
+        }
+        let shared = self
+            .lib
+            .games
+            .iter()
+            .any(|g| g.prefix.starts_with(&dir) || g.exe.starts_with(&dir));
+        if shared {
+            return None;
+        }
+        Some(dir)
+    }
+
+    fn delete_files(&mut self, dir: &Path) {
+        match std::fs::remove_dir_all(dir) {
+            Ok(()) => {
+                self.note(format!("deleted {}", dir.display()));
+                self.spawn_size_scan();
+            }
+            Err(e) => self.fail(format!("could not delete {}: {}", dir.display(), e)),
         }
     }
 
@@ -1067,7 +1126,7 @@ impl App {
                 if let Some(g) = self.selected() {
                     let (id, name) = (g.id.clone(), g.name.clone());
                     self.mode = Mode::Overlay(Overlay::Confirm {
-                        message: format!("Remove \"{}\" from the library? Game files stay on disk.", name),
+                        message: format!("Remove \"{}\" from the library?", name),
                         action: ConfirmAction::Delete(id),
                     });
                 }
@@ -1352,9 +1411,14 @@ impl App {
             Overlay::Confirm { message, action } => match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => match action {
                     ConfirmAction::Delete(id) => self.delete(&id),
+                    ConfirmAction::DeleteFiles(dir) => self.delete_files(&dir),
                     ConfirmAction::Quit => self.should_quit = true,
                 },
-                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('q') => {}
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('q') => {
+                    if let ConfirmAction::DeleteFiles(dir) = action {
+                        self.note(format!("files left in place at {}", dir.display()));
+                    }
+                }
                 _ => self.mode = Mode::Overlay(Overlay::Confirm { message, action }),
             },
             Overlay::Log { title, lines, mut scroll } => match key.code {
