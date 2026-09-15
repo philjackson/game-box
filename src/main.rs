@@ -68,9 +68,14 @@ fn main() -> Result<()> {
         app.on_command(&format!("{} {}", cmd, path));
     }
 
+    // Name the tmux tab / terminal window while the TUI is up. OSC 0 sets the
+    // terminal title; ESC k is tmux's window rename. Empty ESC k on exit hands
+    // the name back to automatic-rename.
+    print!("\x1b]0;gbox\x07\x1bkgbox\x1b\\");
     let mut terminal = ratatui::init();
     let result = run(&mut terminal, &mut app);
     ratatui::restore();
+    print!("\x1b]0;\x07\x1bk\x1b\\");
     result
 }
 
