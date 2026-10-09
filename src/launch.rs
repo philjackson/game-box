@@ -70,6 +70,12 @@ pub fn build_command(game: &Game, runner: &Runner) -> Result<(PathBuf, Vec<Strin
                 "STEAM_COMPAT_CLIENT_INSTALL_PATH".into(),
                 steam_root.to_string_lossy().into(),
             ));
+            // Steam sets this; without it the NVIDIA driver wipes its shader
+            // cache once it outgrows the default size, and a big game
+            // recompiles everything on the next launch.
+            if std::env::var_os("__GL_SHADER_DISK_CACHE_SKIP_CLEANUP").is_none() {
+                env.push(("__GL_SHADER_DISK_CACHE_SKIP_CLEANUP".into(), "1".into()));
+            }
             args.push("run".into());
             args.push(exe);
         }
