@@ -7,6 +7,7 @@ mod launch;
 mod library;
 mod model;
 mod runners;
+mod sandbox;
 mod scan;
 mod sysmon;
 mod theme;

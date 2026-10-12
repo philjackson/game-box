@@ -9,7 +9,8 @@ use ratatui::Frame;
 
 use super::widgets::*;
 use crate::app::{
-    AddSource, AddStep, AddWizard, App, ArgsForm, GsField, GsForm, Mode, Overlay, Prompt,
+    AddSource, AddStep, AddWizard, App, ArgsForm, GsField, GsForm, Mode, Overlay, Prompt, SbField,
+    SbForm,
 };
 use crate::install::{Arch, Phase};
 use crate::launch;
@@ -24,6 +25,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         Overlay::Confirm { message, .. } => confirm(frame, area, message),
         Overlay::RunnerPick { idx, .. } => runner_pick(frame, app, area, *idx),
         Overlay::Gamescope(f) => gamescope(frame, app, area, f),
+        Overlay::Sandbox(f) => sandbox(frame, app, area, f),
         Overlay::Args(f) => args(frame, app, area, f),
         Overlay::ExePick { game_name, scan, idx, .. } => {
             exe_pick(frame, app, area, game_name, scan.as_ref(), *idx)
@@ -79,6 +81,7 @@ fn help(frame: &mut Frame, area: Rect, scroll: u16) {
     row(&mut lines, "R", "change the wine/proton runner");
     row(&mut lines, "e", "change which executable a game launches");
     row(&mut lines, "w", "gamescope settings for this game");
+    row(&mut lines, "Z", "sandbox: what the game can see, network on/off");
     row(&mut lines, "A", "arguments passed to the game itself");
     row(&mut lines, "C", "open winecfg on the prefix");
     row(&mut lines, "o", "read the last launch log");
@@ -101,6 +104,7 @@ fn help(frame: &mut Frame, area: Rect, scroll: u16) {
     row(&mut lines, ":log", "launch log");
     row(&mut lines, ":winecfg", "winecfg on the prefix");
     row(&mut lines, ":gamescope", "gamescope settings (also :gs)");
+    row(&mut lines, ":sandbox", "sandbox settings (also :sb)");
     row(&mut lines, ":args [a b]", "set launch arguments, or open the editor");
     row(&mut lines, ":exe", "change the executable");
     row(&mut lines, ":q", "quit");
@@ -109,6 +113,7 @@ fn help(frame: &mut Frame, area: Rect, scroll: u16) {
     row(&mut lines, "▶", "running right now");
     row(&mut lines, "N", "never played");
     row(&mut lines, "g", "launches inside gamescope");
+    row(&mut lines, "z / Z", "runs sandboxed / sandboxed and offline");
     row(&mut lines, "!", "executable is missing from disk");
 
     lines.push(Line::from(""));
@@ -330,6 +335,167 @@ fn gamescope(frame: &mut Frame, app: &App, area: Rect, f: &GsForm) {
         ));
     }
     let _ = app;
+}
+
+// ----------------------------------------------------- sandbox settings ---
+
+fn sandbox(frame: &mut Frame, app: &App, area: Rect, f: &SbForm) {
+    let game = app.lib.games.iter().find(|g| g.id == f.game_id);
+    let runner = game.and_then(|g| crate::runners::resolve(&app.runners, &g.runner));
+    let built = f.build();
+    // What the game would actually see with these settings.
+    let plan = match (&built, game, runner) {
+        (Ok(cfg), Some(g), Some(r)) if cfg.enabled => {
+            let mut probe = g.clone();
+            probe.sandbox = cfg.clone();
+            launch::sandbox_plan(&probe, r)
+        }
+        _ => None,
+    };
+    // The box is sized to what it ends up holding, so the lines are built
+    // first against the width it will have.
+    let box_w = 78.min(area.width);
+    let inner_w = box_w.saturating_sub(2);
+
+    // Same row geometry as the gamescope editor, so the cursor lands right.
+    const GUTTER_W: u16 = 2;
+    const LABEL_W: u16 = 12;
+    let value_x = GUTTER_W + LABEL_W;
+    let value_w = inner_w.saturating_sub(value_x + 1);
+
+    let mut lines: Vec<Line> = Vec::new();
+    let mut cursor: Option<(u16, u16)> = None;
+    for (i, field) in SbField::ALL.iter().enumerate() {
+        let picked = i == f.field;
+        let live = f.enabled || *field == SbField::Enabled;
+        let label_style = if picked {
+            Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme::DIM)
+        };
+        let value_style = if picked {
+            theme::selected()
+        } else if live {
+            Style::default().fg(theme::FG)
+        } else {
+            Style::default().fg(theme::FAINT)
+        };
+        let value: String = match field {
+            SbField::Enabled => if f.enabled { "on".into() } else { "off".into() },
+            SbField::Network => if f.network { "on".into() } else { "off — offline".into() },
+            _ => {
+                let p = f.prompt(*field).expect("text field has a prompt");
+                if picked {
+                    let field_w = value_w.saturating_sub(1).max(1) as usize;
+                    let chars: Vec<char> = p.value.chars().collect();
+                    let start = p.cursor.saturating_sub(field_w.saturating_sub(1));
+                    let end = (start + field_w).min(chars.len());
+                    cursor = Some((value_x + (p.cursor - start) as u16, i as u16));
+                    chars[start.min(end)..end].iter().collect()
+                } else if p.value.is_empty() {
+                    "—".into()
+                } else {
+                    ellipsize(&p.value, value_w as usize)
+                }
+            }
+        };
+        lines.push(Line::from(vec![
+            Span::styled(if picked { " ▌" } else { "  " }, Style::default().fg(theme::ACCENT)),
+            Span::styled(format!("{:<w$}", field.label(), w = LABEL_W as usize), label_style),
+            Span::styled(format!("{:<w$}", value, w = value_w.max(1) as usize), value_style),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        format!("  {}", f.focused().help()),
+        Style::default().fg(theme::DIM),
+    )));
+    if crate::runners::which("bwrap").is_none() {
+        lines.push(Line::from(Span::styled(
+            "  ⚠ bwrap is not on $PATH — install bubblewrap before turning this on",
+            Style::default().fg(theme::WARN),
+        )));
+    }
+    lines.push(Line::from(""));
+
+    let path_w = inner_w.saturating_sub(16) as usize;
+    let row = |lines: &mut Vec<Line>, what: &str, style: Style, path: &std::path::Path| {
+        // bwrap skips a missing path, so say so rather than list it as seen.
+        let missing = !path.exists();
+        let shown = ellipsize_left(&path.to_string_lossy(), path_w.saturating_sub(if missing { 10 } else { 0 }));
+        let mut spans = vec![
+            Span::styled(format!("   {:<12}", what), Style::default().fg(theme::DIM)),
+            Span::styled(shown, if missing { Style::default().fg(theme::FAINT) } else { style }),
+        ];
+        if missing {
+            spans.push(Span::styled(" (missing)", Style::default().fg(theme::WARN)));
+        }
+        lines.push(Line::from(spans));
+    };
+    match (&built, &plan) {
+        (Err(e), _) => lines.push(Line::from(Span::styled(
+            format!("  ✗ {}", e),
+            Style::default().fg(theme::BAD).add_modifier(Modifier::BOLD),
+        ))),
+        (Ok(_), None) => lines.push(Line::from(Span::styled(
+            "  (off — the game can read and write everything your user can)",
+            Style::default().fg(theme::FAINT),
+        ))),
+        (Ok(_), Some(plan)) => {
+            lines.push(Line::from(Span::styled("  what it can see", Style::default().fg(theme::DIM))));
+            let rw = Style::default().fg(theme::FG);
+            let ro = Style::default().fg(theme::DIM);
+            let mut shown = 0;
+            for p in plan.required.iter().chain(&plan.read_write) {
+                if shown < 12 {
+                    row(&mut lines, "read-write", rw, p);
+                }
+                shown += 1;
+            }
+            for p in &plan.read_only {
+                if shown < 12 {
+                    row(&mut lines, "read-only", ro, p);
+                }
+                shown += 1;
+            }
+            if shown > 12 {
+                lines.push(Line::from(Span::styled(
+                    format!("   … {} more", shown - 12),
+                    Style::default().fg(theme::FAINT),
+                )));
+            }
+            // Made on first launch, so not "missing" before then.
+            lines.push(Line::from(vec![
+                Span::styled(format!("   {:<12}", "home"), Style::default().fg(theme::DIM)),
+                Span::styled(ellipsize_left(&plan.home_dir().to_string_lossy(), path_w), ro),
+            ]));
+            lines.push(Line::from(Span::styled(
+                "   + /usr, /etc, the display, audio, GPU and controllers",
+                Style::default().fg(theme::FAINT),
+            )));
+        }
+    }
+    if let Some(err) = &f.error {
+        lines.push(Line::from(Span::styled(
+            format!("  ✗ {}", err),
+            Style::default().fg(theme::BAD).add_modifier(Modifier::BOLD),
+        )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(footer("↑/↓ field   space toggle   ↵ save   Esc cancel"));
+
+    let area = centered_fixed(box_w, (lines.len() as u16 + 2).min(area.height), area);
+    let inner = panel(frame, area, &format!("sandbox · {}", ellipsize(&f.game_name, 24)));
+    frame.render_widget(Paragraph::new(lines), inner);
+
+    if let Some((cx, cy)) = cursor {
+        frame.set_cursor_position((
+            (inner.x + cx).min(inner.right().saturating_sub(1)),
+            inner.y + cy,
+        ));
+    }
 }
 
 // ---------------------------------------------------- launch arguments ---
@@ -619,16 +785,16 @@ fn add(frame: &mut Frame, app: &App, area: Rect, w: &AddWizard) {
         AddStep::Dest => "↵ next   Tab/^j/^k step through folders   ↑ back   ^u clear   Esc",
         AddStep::MakePrefix => "y/↵ build one here   n/⌫ pick another directory   Esc cancel",
         AddStep::Arch if w.source == AddSource::Bootstrap => {
-            "space toggle   ↵ build the prefix   ⌫ back   Esc cancel"
+            "space toggle   s sandbox   ↵ build the prefix   ⌫ back   Esc cancel"
         }
-        AddStep::Arch => "space toggle   ↵ start installing   ⌫ back   Esc cancel",
+        AddStep::Arch => "space toggle   s sandbox   ↵ start installing   ⌫ back   Esc cancel",
         AddStep::Installing if installing_live => "x cancel   o full log   Esc leave it running",
         AddStep::Installing => "↵ scan the prefix by hand   o full log   Esc close",
         AddStep::Scanning => "Esc cancel",
         AddStep::Exe => "j/k choose   ↵ next   ⌫ back   Esc cancel",
         AddStep::Runner => "j/k choose   ↵ next   ⌫ back   Esc cancel",
         AddStep::Name => "↵ next   ⌫ back   Esc cancel",
-        AddStep::Confirm => "↵ add to library   ⌫ back   Esc cancel",
+        AddStep::Confirm => "↵ add to library   s sandbox   ⌫ back   Esc cancel",
     };
     let mut tail: Vec<Line> = Vec::new();
     if let Some(err) = &w.error {
@@ -909,6 +1075,8 @@ fn step_arch(frame: &mut Frame, area: Rect, app: &App, w: &AddWizard) {
             Style::default().fg(theme::WARN),
         )));
     }
+    lines.push(Line::from(""));
+    lines.push(sandbox_line(w.sandbox));
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         if w.source == AddSource::Bootstrap {
@@ -1310,6 +1478,20 @@ fn step_runner(frame: &mut Frame, area: Rect, app: &App, w: &AddWizard) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
+/// The wizard's sandbox row: what `s` toggles, and what it means.
+fn sandbox_line(on: bool) -> Line<'static> {
+    let (value, style, what) = if on {
+        ("on ", Style::default().fg(theme::GOOD), "sees its own directory, not your files")
+    } else {
+        ("off", Style::default().fg(theme::WARN), "sees everything your user can")
+    };
+    Line::from(vec![
+        Span::styled(format!(" {:<11}", "sandbox"), Style::default().fg(theme::DIM)),
+        Span::styled(value, style.add_modifier(Modifier::BOLD)),
+        Span::styled(format!("  {}", what), Style::default().fg(theme::DIM)),
+    ])
+}
+
 fn step_name(frame: &mut Frame, area: Rect, w: &AddWizard) -> Option<(u16, u16)> {
     let (input, cursor_x) = input_line(&w.prompt, area.width);
     frame.render_widget(
@@ -1338,6 +1520,7 @@ fn step_confirm(frame: &mut Frame, area: Rect, app: &App, w: &AddWizard) {
     lines.push(field("name", w.name.clone()));
     lines.push(field("executable", ellipsize_left(&exe.to_string_lossy(), vw)));
     lines.push(field("prefix", ellipsize_left(&prefix.to_string_lossy(), vw)));
+    lines.push(sandbox_line(w.sandbox));
     if let Some(r) = app.runners.get(w.runner_idx) {
         lines.push(field("runner", format!("{} ({})", r.name, r.kind.label())));
 
@@ -1354,6 +1537,7 @@ fn step_confirm(frame: &mut Frame, area: Rect, app: &App, w: &AddWizard) {
             tags: Vec::new(),
             notes: String::new(),
             gamescope: Gamescope::default(),
+            sandbox: if w.sandbox { Sandbox::on() } else { Sandbox::default() },
             added: chrono::Utc::now(),
             last_played: None,
             playtime_secs: 0,

@@ -254,11 +254,11 @@ fn index(frame: &mut Frame, app: &mut App, area: Rect) {
     let size_w = 6;
     let played_w = 9;
     let time_w = 6;
-    let fixed = 4 + runner_w + size_w + played_w + time_w + 4;
+    let fixed = 5 + runner_w + size_w + played_w + time_w + 4;
     let name_w = w.saturating_sub(fixed).max(8);
 
     let head = Line::from(vec![
-        Span::styled("    ", Style::default()),
+        Span::styled("     ", Style::default()),
         Span::styled(format!("{:<w$} ", "GAME", w = name_w), Style::default().fg(theme::DIM)),
         Span::styled(format!("{:<w$} ", "RUNNER", w = runner_w), Style::default().fg(theme::DIM)),
         Span::styled(format!("{:>w$} ", "SIZE", w = size_w), Style::default().fg(theme::DIM)),
@@ -343,6 +343,12 @@ fn index(frame: &mut Frame, app: &mut App, area: Rect) {
         // Second flag column: gamescope is a launch-changing setting, so it
         // deserves to be visible without opening the game.
         let gs_flag = if g.gamescope.enabled { "g" } else { " " };
+        // Third: whether it is confined, and whether it is offline too.
+        let sb_flag = match (g.sandbox.enabled, g.sandbox.network) {
+            (false, _) => " ",
+            (true, true) => "z",
+            (true, false) => "Z",
+        };
 
         lines.push(Line::from(vec![
             Span::styled(cursor_mark, Style::default().fg(theme::ACCENT)),
@@ -350,6 +356,10 @@ fn index(frame: &mut Frame, app: &mut App, area: Rect) {
             Span::styled(
                 gs_flag,
                 if selected { base } else { Style::default().fg(theme::HILITE) },
+            ),
+            Span::styled(
+                sb_flag,
+                if selected { base } else { Style::default().fg(theme::GOOD) },
             ),
             Span::styled(" ", base),
             Span::styled(
@@ -460,6 +470,7 @@ fn hints(width: u16) -> Line<'static> {
         ("R", "runner"),
         ("e", "exe"),
         ("w", "gscope"),
+        ("Z", "sandbox"),
         ("A", "args"),
         ("o", "log"),
         ("d", "remove"),

@@ -215,6 +215,8 @@ pub struct AddWizard {
     pub installer: Option<PathBuf>,
     pub dest: Option<PathBuf>,
     pub arch: crate::install::Arch,
+    /// Whether the installer, and the game it becomes, run inside bwrap.
+    pub sandbox: bool,
     pub scan: Option<ScanResult>,
     pub rx: Option<Receiver<ScanResult>>,
     pub exe_idx: usize,
@@ -234,6 +236,7 @@ impl AddWizard {
             installer: None,
             dest: None,
             arch: crate::install::Arch::Win64,
+            sandbox: runners::which("bwrap").is_some(),
             scan: None,
             rx: None,
             exe_idx: 0,
@@ -275,6 +278,7 @@ impl AddWizard {
         w.installer = job.kind.installer().map(|p| p.to_path_buf());
         w.dest = Some(job.dest.clone());
         w.arch = job.arch;
+        w.sandbox = job.sandbox.enabled;
         w
     }
 
@@ -454,6 +458,126 @@ impl GsForm {
     }
 }
 
+/// The sandbox editor. The path lists are typed as lines so a quoted path
+/// with spaces in it survives, the same way launch arguments do.
+#[derive(Debug)]
+pub struct SbForm {
+    pub game_id: String,
+    pub game_name: String,
+    pub enabled: bool,
+    pub network: bool,
+    pub read_only: Prompt,
+    pub read_write: Prompt,
+    pub field: usize,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SbField {
+    Enabled,
+    Network,
+    ReadOnly,
+    ReadWrite,
+}
+
+impl SbField {
+    pub const ALL: [SbField; 4] = [SbField::Enabled, SbField::Network, SbField::ReadOnly, SbField::ReadWrite];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SbField::Enabled => "sandbox",
+            SbField::Network => "network",
+            SbField::ReadOnly => "read-only",
+            SbField::ReadWrite => "read-write",
+        }
+    }
+
+    pub fn help(self) -> &'static str {
+        match self {
+            SbField::Enabled => "run inside bwrap: only the game's own directories are visible",
+            SbField::Network => "off gives the game loopback only — no internet, no LAN",
+            SbField::ReadOnly => "extra paths it may read · space-separated, quote ones with spaces",
+            SbField::ReadWrite => "extra paths it may change — a shared saves folder, a mods dir",
+        }
+    }
+
+    pub fn is_text(self) -> bool {
+        matches!(self, SbField::ReadOnly | SbField::ReadWrite)
+    }
+}
+
+impl SbForm {
+    pub fn new(game: &Game) -> SbForm {
+        let sb = &game.sandbox;
+        let line = |ps: &[PathBuf]| {
+            join_args(&ps.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>())
+        };
+        SbForm {
+            game_id: game.id.clone(),
+            game_name: game.name.clone(),
+            enabled: sb.enabled,
+            network: sb.network,
+            read_only: Prompt::new("", &line(&sb.read_only)),
+            read_write: Prompt::new("", &line(&sb.read_write)),
+            field: 0,
+            error: None,
+        }
+    }
+
+    pub fn focused(&self) -> SbField {
+        SbField::ALL[self.field.min(SbField::ALL.len() - 1)]
+    }
+
+    pub fn prompt(&self, field: SbField) -> Option<&Prompt> {
+        match field {
+            SbField::ReadOnly => Some(&self.read_only),
+            SbField::ReadWrite => Some(&self.read_write),
+            _ => None,
+        }
+    }
+
+    fn prompt_mut(&mut self, field: SbField) -> Option<&mut Prompt> {
+        match field {
+            SbField::ReadOnly => Some(&mut self.read_only),
+            SbField::ReadWrite => Some(&mut self.read_write),
+            _ => None,
+        }
+    }
+
+    /// Validate the buffers into a config, or say what is wrong.
+    pub fn build(&self) -> Result<Sandbox, String> {
+        Ok(Sandbox {
+            enabled: self.enabled,
+            network: self.network,
+            read_only: parse_paths(&self.read_only.value)?,
+            read_write: parse_paths(&self.read_write.value)?,
+        })
+    }
+}
+
+/// A line of paths: `~` expands, relative ones are refused (they would be
+/// relative to wherever gbox happened to start), and none may put the home
+/// directory back.
+fn parse_paths(line: &str) -> Result<Vec<PathBuf>, String> {
+    let home = dirs::home_dir().unwrap_or_default();
+    parse_args(line)?
+        .into_iter()
+        .map(|raw| {
+            let path = match raw.strip_prefix('~') {
+                Some(rest) => home.join(rest.trim_start_matches('/')),
+                None => PathBuf::from(&raw),
+            };
+            if !path.is_absolute() {
+                return Err(format!("\"{}\" is not an absolute path", raw));
+            }
+            if path == Path::new("/") || home.starts_with(&path) {
+                return Err(format!("{} would expose your whole home", path.display()));
+            }
+            Ok(path)
+        })
+        .collect()
+}
+
 /// The launch-argument editor: one line of text, parsed into argv. Kept
 /// separate from the gamescope form because these go to the game, not to the
 /// wrapper around it.
@@ -487,6 +611,7 @@ impl ArgsForm {
 struct PendingRegister {
     name: String,
     runner: RunnerRef,
+    sandbox: Sandbox,
     rx: Receiver<ScanResult>,
 }
 
@@ -513,6 +638,7 @@ pub enum Overlay {
         idx: usize,
     },
     Gamescope(Box<GsForm>),
+    Sandbox(Box<SbForm>),
     Args(Box<ArgsForm>),
     Log { title: String, lines: Vec<String>, scroll: usize },
 }
@@ -995,8 +1121,36 @@ impl App {
         } else {
             g.prefix.clone()
         };
-        match std::process::Command::new(&bin)
-            .env("WINEPREFIX", &prefix)
+        // winecfg loads the prefix's dlls, which a sandboxed game could have
+        // planted there — so it gets the game's sandbox too.
+        let mut cmd = match launch::sandbox_plan(&g, &runner) {
+            Some(plan) => {
+                let mut env = crate::display::detect().vars();
+                env.push(("WINEPREFIX".into(), prefix.to_string_lossy().into_owned()));
+                let wrapped = plan
+                    .prepare()
+                    .and_then(|_| plan.wrap(&bin, &[], &env))
+                    .and_then(|argv| Ok((crate::sandbox::bwrap()?, argv)));
+                let (bwrap, argv) = match wrapped {
+                    Ok(w) => w,
+                    Err(e) => {
+                        self.fail(format!("winecfg: {}", e));
+                        return;
+                    }
+                };
+                let mut c = std::process::Command::new(bwrap);
+                c.args(argv);
+                launch::detach(&mut c, true);
+                c
+            }
+            None => {
+                let mut c = std::process::Command::new(&bin);
+                c.env("WINEPREFIX", &prefix);
+                c
+            }
+        };
+        match cmd
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
@@ -1025,7 +1179,8 @@ impl App {
             w.name.trim().to_string()
         };
         let runner = RunnerRef::of(runner);
-        self.insert_game(&name, exe, prefix, runner)?;
+        let sandbox = if w.sandbox { Sandbox::on() } else { Sandbox::default() };
+        self.insert_game(&name, exe, prefix, runner, sandbox)?;
         self.note(format!("added {}", name));
         Ok(())
     }
@@ -1038,6 +1193,7 @@ impl App {
         exe: PathBuf,
         prefix: PathBuf,
         runner: RunnerRef,
+        sandbox: Sandbox,
     ) -> Result<String, String> {
         if self.lib.games.iter().any(|g| g.exe == exe) {
             return Err("that executable is already in the library".into());
@@ -1055,6 +1211,7 @@ impl App {
             tags: Vec::new(),
             notes: String::new(),
             gamescope: Gamescope::default(),
+            sandbox,
             added: Utc::now(),
             last_played: None,
             playtime_secs: 0,
@@ -1146,6 +1303,7 @@ impl App {
             KeyCode::Char('x') | KeyCode::Char('K') => self.kill_selected(),
             KeyCode::Char('o') => self.open_log(),
             KeyCode::Char('w') => self.open_gamescope(),
+            KeyCode::Char('Z') => self.open_sandbox(),
             KeyCode::Char('A') => self.open_args(),
             KeyCode::Char('e') => self.open_exe_pick(),
             KeyCode::Char('C') => self.run_winecfg(),
@@ -1331,6 +1489,7 @@ impl App {
             "log" => self.open_log(),
             "winecfg" => self.run_winecfg(),
             "gs" | "gamescope" => self.open_gamescope(),
+            "sb" | "sandbox" => self.open_sandbox(),
             "args" => {
                 // Bare `:args` opens the editor; a rest sets them outright, so
                 // a known flag needs no round trip through the overlay.
@@ -1464,6 +1623,7 @@ impl App {
                 _ => self.mode = Mode::Overlay(Overlay::RunnerPick { game_id, idx }),
             },
             Overlay::Gamescope(f) => self.key_gamescope(key, f),
+            Overlay::Sandbox(f) => self.key_sandbox(key, f),
             Overlay::Args(f) => self.key_args(key, f),
             Overlay::ExePick { game_id, game_name, scan, rx, mut idx } => {
                 let n = scan.as_ref().map(|s| s.candidates.len()).unwrap_or(0);
@@ -1722,6 +1882,7 @@ impl App {
                         crate::install::Arch::Win32 => crate::install::Arch::Win64,
                     };
                 }
+                KeyCode::Char('s') => w.sandbox = !w.sandbox,
                 KeyCode::Backspace => w.step = AddStep::Runner,
                 KeyCode::Enter => match self.start_job(&w) {
                     Ok(()) => w.step = AddStep::Installing,
@@ -1855,6 +2016,7 @@ impl App {
                         w.error = Some(e);
                     }
                 },
+                KeyCode::Char('s') => w.sandbox = !w.sandbox,
                 KeyCode::Backspace | KeyCode::Char('n') => w.step = AddStep::Name,
                 _ => {}
             },
@@ -1956,6 +2118,57 @@ impl App {
         self.mode = Mode::Overlay(Overlay::Gamescope(Box::new(form)));
     }
 
+    fn key_sandbox(&mut self, key: KeyEvent, mut f: Box<SbForm>) {
+        let focused = f.focused();
+        let n = SbField::ALL.len();
+        f.error = None;
+        match key.code {
+            KeyCode::Esc => return, // discard the edits
+            KeyCode::Enter => match f.build() {
+                Ok(cfg) => {
+                    let (id, name, summary) = (f.game_id.clone(), f.game_name.clone(), cfg.summary());
+                    let running = self.is_running(&id);
+                    if let Some(g) = self.game_mut(&id) {
+                        g.sandbox = cfg;
+                    }
+                    let _ = self.lib.save();
+                    let when = if running { " — from the next launch" } else { "" };
+                    self.note(format!("{}: sandbox {}{}", name, summary, when));
+                    return;
+                }
+                Err(e) => f.error = Some(e),
+            },
+            KeyCode::Down | KeyCode::Tab => f.field = (f.field + 1) % n,
+            KeyCode::Up | KeyCode::BackTab => f.field = (f.field + n - 1) % n,
+            KeyCode::Char('j') if !focused.is_text() => f.field = (f.field + 1) % n,
+            KeyCode::Char('k') if !focused.is_text() => f.field = (f.field + n - 1) % n,
+            KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right if !focused.is_text() => match focused {
+                SbField::Enabled => f.enabled = !f.enabled,
+                SbField::Network => f.network = !f.network,
+                _ => {}
+            },
+            _ if focused.is_text() => {
+                if let Some(p) = f.prompt_mut(focused) {
+                    Self::prompt_key(p, key);
+                }
+            }
+            _ => {}
+        }
+        self.mode = Mode::Overlay(Overlay::Sandbox(f));
+    }
+
+    fn open_sandbox(&mut self) {
+        let Some(game) = self.selected() else {
+            self.fail("no game selected");
+            return;
+        };
+        let form = SbForm::new(game);
+        if runners::which("bwrap").is_none() {
+            self.fail("bwrap is not on $PATH — install bubblewrap for the sandbox to run");
+        }
+        self.mode = Mode::Overlay(Overlay::Sandbox(Box::new(form)));
+    }
+
     fn key_args(&mut self, key: KeyEvent, mut f: Box<ArgsForm>) {
         f.error = None;
         match key.code {
@@ -2038,11 +2251,12 @@ impl App {
         let dest = job.dest.clone();
         let name = titleize(&dest.file_name().unwrap_or_default().to_string_lossy());
         let runner = RunnerRef { kind: job.runner.kind, name: job.runner.name.clone() };
+        let sandbox = job.sandbox.clone();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(scan::scan_dir(&dest, 8, 60));
         });
-        self.register = Some(PendingRegister { name, runner, rx });
+        self.register = Some(PendingRegister { name, runner, sandbox, rx });
     }
 
     /// Turn that scan into a library entry. Called every tick.
@@ -2066,7 +2280,7 @@ impl App {
         let exe = scan::absolute(&best.path);
         let rel = best.rel.clone();
         let count = result.candidates.len();
-        match self.insert_game(&pending.name, exe, scan::absolute(&prefix), pending.runner) {
+        match self.insert_game(&pending.name, exe, scan::absolute(&prefix), pending.runner, pending.sandbox) {
             Ok(_) => {
                 // Always say which executable was chosen: the guess is usually
                 // right, but the user should never have to wonder.
@@ -2104,11 +2318,15 @@ impl App {
             .get(w.runner_idx)
             .cloned()
             .ok_or("no runner available — install proton or wine")?;
+        let sandbox = if w.sandbox { Sandbox::on() } else { Sandbox::default() };
+        if sandbox.enabled {
+            crate::sandbox::bwrap().map_err(|e| e.to_string())?;
+        }
         let job = match w.source {
-            AddSource::Bootstrap => crate::install::InstallJob::boot(dest, runner, w.arch),
+            AddSource::Bootstrap => crate::install::InstallJob::boot(dest, runner, w.arch, sandbox),
             _ => {
                 let installer = w.installer.clone().ok_or("no installer chosen")?;
-                crate::install::InstallJob::start(installer, dest, runner, w.arch)
+                crate::install::InstallJob::start(installer, dest, runner, w.arch, sandbox)
             }
         };
         self.install = Some(job);

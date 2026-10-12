@@ -125,7 +125,7 @@ pub fn first_x11_display(dir: &Path) -> Option<String> {
     nums.first().map(|n| format!(":{}", n))
 }
 
-fn uid() -> u32 {
+pub fn uid() -> u32 {
     // Avoid a libc dependency for one number.
     std::fs::read_to_string("/proc/self/status")
         .ok()

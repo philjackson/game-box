@@ -6,7 +6,6 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,7 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::library;
-use crate::model::{Runner, RunnerKind};
+use crate::model::{Runner, RunnerKind, Sandbox};
+use crate::sandbox::Plan;
 
 /// Prefix bitness. Only meaningful for wine — proton is 64-bit with a WoW64
 /// layer, and ignores WINEARCH.
@@ -93,6 +93,8 @@ pub struct InstallJob {
     pub prefix: PathBuf,
     pub runner: Runner,
     pub arch: Arch,
+    /// Passed on to the game the install turns into.
+    pub sandbox: Sandbox,
     pub log: PathBuf,
     pub started: Instant,
     phase: Arc<Mutex<Phase>>,
@@ -150,6 +152,11 @@ impl InstallJob {
                 // wineserver children too.
                 unsafe {
                     kill(-(child.id() as i32), 15);
+                    // Inside bwrap the group holds the namespace's pid 1, and
+                    // killing that is the only way to reach its wineserver.
+                    if self.sandbox.enabled {
+                        kill(-(child.id() as i32), 9);
+                    }
                 }
                 let _ = child.kill();
             }
@@ -168,18 +175,18 @@ impl InstallJob {
 
     /// Run an installer inside a fresh prefix. Returns immediately; watch
     /// [`InstallJob::phase`].
-    pub fn start(installer: PathBuf, dest: PathBuf, runner: Runner, arch: Arch) -> InstallJob {
-        Self::spawn(JobKind::Install(crate::scan::absolute(&installer)), dest, runner, arch)
+    pub fn start(installer: PathBuf, dest: PathBuf, runner: Runner, arch: Arch, sandbox: Sandbox) -> InstallJob {
+        Self::spawn(JobKind::Install(crate::scan::absolute(&installer)), dest, runner, arch, sandbox)
     }
 
     /// Build a prefix around a game that is already unpacked in `dest`, and
     /// stop there. Nothing is installed: this only lays down `drive_c` and the
     /// registry a game needs to run at all.
-    pub fn boot(dest: PathBuf, runner: Runner, arch: Arch) -> InstallJob {
-        Self::spawn(JobKind::Prefix, dest, runner, arch)
+    pub fn boot(dest: PathBuf, runner: Runner, arch: Arch, sandbox: Sandbox) -> InstallJob {
+        Self::spawn(JobKind::Prefix, dest, runner, arch, sandbox)
     }
 
-    fn spawn(kind: JobKind, dest: PathBuf, runner: Runner, arch: Arch) -> InstallJob {
+    fn spawn(kind: JobKind, dest: PathBuf, runner: Runner, arch: Arch, sandbox: Sandbox) -> InstallJob {
         // wine rejects a relative WINEPREFIX outright and proton resolves it
         // against the working directory we hand the child, so neither may
         // ever see one.
@@ -197,6 +204,7 @@ impl InstallJob {
             prefix: prefix.clone(),
             runner: runner.clone(),
             arch,
+            sandbox: sandbox.clone(),
             log: log.clone(),
             started: Instant::now(),
             phase: Arc::new(Mutex::new(Phase::Preparing)),
@@ -209,7 +217,7 @@ impl InstallJob {
         let cancelled = Arc::clone(&job.cancelled);
 
         std::thread::spawn(move || {
-            let worker = Worker { phase, child_slot, cancelled, log, dest, prefix, kind, runner, arch };
+            let worker = Worker { phase, child_slot, cancelled, log, dest, prefix, kind, runner, arch, sandbox };
             worker.run();
         });
 
@@ -227,6 +235,7 @@ struct Worker {
     kind: JobKind,
     runner: Runner,
     arch: Arch,
+    sandbox: Sandbox,
 }
 
 impl Worker {
@@ -262,7 +271,7 @@ impl Worker {
             return;
         }
         self.say(&format!(
-            "# game-box {}\n{}# destination {}\n# prefix {}\n# runner {} ({}, {})\n",
+            "# game-box {}\n{}# destination {}\n# prefix {}\n# runner {} ({}, {})\n# sandbox {}\n",
             self.kind.noun(),
             self.kind
                 .installer()
@@ -273,6 +282,7 @@ impl Worker {
             self.runner.name,
             self.runner.kind.label(),
             self.arch.label(),
+            self.sandbox.summary(),
         ));
 
         // --- create the prefix -------------------------------------------
@@ -353,8 +363,10 @@ impl Worker {
     /// Returns whether a prefix is there once the dust has settled.
     fn settle(&self) -> bool {
         // `wineserver -w` blocks until the prefix's server exits. Bounded,
-        // since a wedged server would otherwise hang the job for good.
-        let quiet = crate::runners::wineserver_for(&self.runner).is_some_and(|ws| {
+        // since a wedged server would otherwise hang the job for good. A
+        // sandboxed run already waited for it inside, and its server is gone
+        // with the namespace.
+        let quiet = self.sandbox.enabled || crate::runners::wineserver_for(&self.runner).is_some_and(|ws| {
             self.say("\n# waiting for the wineserver to finish\n");
             // Proton's env names the compat directory, not the prefix itself.
             let prefix = self.prefix.to_string_lossy();
@@ -406,6 +418,28 @@ impl Worker {
         env
     }
 
+    /// What the installer may see: the destination read-write, and the folder
+    /// the setup .exe sits in read-only — installers look beside themselves
+    /// for their data files. When that folder is `$HOME` itself, only the
+    /// .exe goes in.
+    fn plan(&self) -> Plan {
+        let installer = self.kind.installer();
+        let dir = installer.and_then(Path::parent).filter(|d| {
+            let home = dirs::home_dir().unwrap_or_default();
+            d.is_dir() && !home.starts_with(d)
+        });
+        let cwd = dir.map(Path::to_path_buf).unwrap_or_else(|| self.dest.clone());
+        let mut plan = Plan::new(&self.dest, &self.prefix, &self.runner, &self.sandbox, &cwd);
+        // The log is the child's stdout; see `launch::sandbox_plan`.
+        plan.read_write.push(self.log.clone());
+        match (dir, installer) {
+            (Some(d), _) => plan.read_only.push(d.to_path_buf()),
+            (None, Some(i)) => plan.read_only.push(i.to_path_buf()),
+            (None, None) => {}
+        }
+        plan
+    }
+
     fn spawn_and_wait(&self, bin: &Path, args: &[String]) -> Result<i32, String> {
         self.spawn_and_wait_with(bin, args, &[], None)
     }
@@ -431,23 +465,33 @@ impl Worker {
         let mut env = self.env();
         env.extend(extra_env.iter().map(|(k, v)| (k.to_string(), v.to_string())));
 
-        let child = Command::new(bin)
-            .args(args)
-            .envs(env)
-            .current_dir(
-                self.kind
-                    .installer()
-                    .and_then(Path::parent)
-                    .filter(|p| p.is_dir())
-                    .map(Path::to_path_buf)
-                    .unwrap_or_else(|| self.dest.clone()),
-            )
-            .process_group(0)
+        let cwd = self
+            .kind
+            .installer()
+            .and_then(Path::parent)
+            .filter(|p| p.is_dir())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.dest.clone());
+        let mut cmd = if self.sandbox.enabled {
+            let plan = self.plan();
+            plan.prepare().map_err(|e| e.to_string())?;
+            let argv = plan.wrap(bin, args, &env).map_err(|e| e.to_string())?;
+            let bwrap = crate::sandbox::bwrap().map_err(|e| e.to_string())?;
+            self.say(&format!("\n# {}\n", crate::launch::shell_line(&(bwrap.clone(), argv.clone(), Vec::new()))));
+            let mut c = Command::new(bwrap);
+            c.args(argv);
+            c
+        } else {
+            let mut c = Command::new(bin);
+            c.args(args).envs(env);
+            c
+        };
+        cmd.current_dir(cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
-            .stderr(Stdio::from(err_log))
-            .spawn()
-            .map_err(|e| format!("{}: {}", bin.display(), e))?;
+            .stderr(Stdio::from(err_log));
+        crate::launch::detach(&mut cmd, self.sandbox.enabled);
+        let child = cmd.spawn().map_err(|e| format!("{}: {}", bin.display(), e))?;
 
         // Publish the handle so a cancel can reach it, then wait.
         if let Ok(mut slot) = self.child_slot.lock() {

@@ -88,10 +88,57 @@ carry a `g` flag in the index. Enabling it without gamescope on `$PATH` is
 allowed but says so, and the launch fails with a clear message rather than
 silently running without it.
 
+## Sandbox
+
+wine is not a security boundary: `Z:` is `/`, and Windows code can call Linux
+directly. With the sandbox on, the runner starts inside
+[bubblewrap](https://github.com/containers/bubblewrap) instead, and the game
+can only see:
+
+- its own directory (and the prefix, if that lives elsewhere), read-write;
+- the runner's install directory, read-only;
+- `/usr`, `/etc`, `/opt`, `/sys` — read-only;
+- the display, PipeWire/Pulse, the GPU and game controllers;
+- whatever extra paths you give it.
+
+The rest of `$HOME` is swapped for a private one kept per game under
+`~/.local/share/game-box/sandbox/`, so its dotfiles and shader caches persist
+without it ever seeing yours. It gets its own pid namespace (no view of your
+other processes), no controlling terminal, and only an allowlist of your
+environment — tokens in your shell's environment stay out.
+
+`Z` (or `:sandbox`) opens the settings:
+
+- **network** — off gives the game a network namespace with nothing but
+  loopback: no internet, no LAN.
+- **read-only / read-write** — extra paths, space-separated, quoted when they
+  contain spaces; `~` expands. Binding `$HOME` itself (or `/`) is refused.
+
+The add wizard turns the sandbox on for new games whenever `bwrap` is
+installed — `s` on the confirm step (or the prefix-architecture step, for an
+installer) toggles it — and an installer runs inside the same sandbox as the
+game it becomes. winecfg follows the game's setting. Sandboxed games carry a
+`z` in the index, or `Z` when offline too.
+
+Things to know:
+
+- **Saves in `Documents`.** A wine prefix links "My Documents" to your real
+  `~/Documents`; inside the sandbox that is the private home. A game that
+  already saved there will not see those saves until you add the folder
+  (e.g. `"~/Documents/My Games"`) as a read-write path.
+- **X11.** Without gamescope the game shares your X server (Xwayland), and X
+  lets any client read the keyboard and other windows. With gamescope on a
+  wayland desktop, gamescope runs inside the sandbox and the game only gets
+  gamescope's own Xwayland.
+- **Stopping.** `x` asks politely as before; the second `x` kills the
+  sandbox's pid namespace, which takes every process in it down.
+- It is filesystem, process and network isolation, not a seccomp jail: the
+  kernel is still the kernel.
+
 ## Keys
 
 `j`/`k` move · `Enter` play · `x` kill · `a` add · `i` install · `R` runner ·
-`e` executable · `w` gamescope · `C` winecfg ·
+`e` executable · `w` gamescope · `Z` sandbox · `C` winecfg ·
 `o` log · `d` remove · `/` search · `s` sort · `b`/`v` panes · `:` command ·
 `?` full help · `q` quit.
 
@@ -100,6 +147,7 @@ silently running without it.
 - library: `~/.local/share/game-box/library.json`
 - launch logs: `~/.local/share/game-box/logs/<id>.log`
 - install logs: `~/.local/share/game-box/logs/install-<prefix>.log`
+- sandboxed games' private homes: `~/.local/share/game-box/sandbox/<game>-<hash>/home`
 
 Runners are discovered from `~/.local/share/Steam/compatibilitytools.d`,
 Steam's `steamapps/common`, `~/.local/share/lutris/runners/wine`, and `wine`

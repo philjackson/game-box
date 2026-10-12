@@ -218,6 +218,57 @@ impl Gamescope {
     }
 }
 
+/// Per-game bubblewrap sandbox. When on, the runner starts in a private mount
+/// namespace where only the game's own directories, the runner and the system
+/// libraries exist — the rest of `$HOME` is replaced by a private one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sandbox {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Off gives the game a network namespace of its own with nothing but
+    /// loopback in it: no internet, no LAN.
+    #[serde(default = "yes")]
+    pub network: bool,
+    /// Extra host paths the game may read.
+    #[serde(default)]
+    pub read_only: Vec<PathBuf>,
+    /// Extra host paths the game may read and write — a shared saves folder,
+    /// a mods directory.
+    #[serde(default)]
+    pub read_write: Vec<PathBuf>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl Default for Sandbox {
+    fn default() -> Self {
+        Sandbox { enabled: false, network: true, read_only: Vec::new(), read_write: Vec::new() }
+    }
+}
+
+impl Sandbox {
+    /// A fresh sandbox, switched on, for a game coming into the library.
+    pub fn on() -> Sandbox {
+        Sandbox { enabled: true, ..Default::default() }
+    }
+
+    /// One-line description for the index and detail pane.
+    pub fn summary(&self) -> String {
+        if !self.enabled {
+            return "off".into();
+        }
+        let mut parts: Vec<String> = vec!["on".into()];
+        parts.push(if self.network { "network".into() } else { "offline".into() });
+        let extra = self.read_only.len() + self.read_write.len();
+        if extra > 0 {
+            parts.push(format!("+{} path{}", extra, if extra == 1 { "" } else { "s" }));
+        }
+        parts.join(" · ")
+    }
+}
+
 /// Parse a `WIDTHxHEIGHT` pair; an empty string means "unset".
 pub fn parse_resolution(s: &str) -> Result<Option<(u32, u32)>, String> {
     let s = s.trim();
@@ -325,6 +376,8 @@ pub struct Game {
     pub notes: String,
     #[serde(default)]
     pub gamescope: Gamescope,
+    #[serde(default)]
+    pub sandbox: Sandbox,
     pub added: DateTime<Utc>,
     #[serde(default)]
     pub last_played: Option<DateTime<Utc>>,
@@ -578,6 +631,7 @@ mod tests {
             tags: vec![],
             notes: String::new(),
             gamescope: Gamescope::default(),
+            sandbox: Sandbox::default(),
             added: Utc::now(),
             last_played: None,
             playtime_secs: 0,
@@ -604,6 +658,7 @@ mod tests {
             tags: vec![],
             notes: String::new(),
             gamescope: Gamescope::default(),
+            sandbox: Sandbox::default(),
             added: Utc::now(),
             last_played: None,
             playtime_secs: 0,

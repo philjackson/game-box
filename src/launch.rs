@@ -12,6 +12,7 @@ use crate::library;
 use crate::display::{self, Display};
 use crate::model::{Game, Runner, RunnerKind};
 use crate::runners;
+use crate::sandbox::{self, Plan};
 
 /// A game we have started and are still watching.
 #[derive(Debug)]
@@ -25,14 +26,52 @@ pub struct Session {
     /// The WINEPREFIX this session is using, for a forced shutdown.
     pub prefix: PathBuf,
     pub wineserver: Option<PathBuf>,
+    /// Runs inside bwrap: the wineserver is out of reach, and the pid
+    /// namespace is what a forced stop takes down.
+    pub sandboxed: bool,
     /// Set once the user has asked for a graceful stop, so a second press can
     /// escalate.
     pub kill_requested: bool,
 }
 
+type Argv = (PathBuf, Vec<String>, Vec<(String, String)>);
+
 /// The exact command that would be run, for the confirm screen and the log
-/// header. Returned as (program, args, env).
-pub fn build_command(game: &Game, runner: &Runner) -> Result<(PathBuf, Vec<String>, Vec<(String, String)>)> {
+/// header. Returned as (program, args, env); a sandboxed game's env travels
+/// inside the bwrap arguments instead.
+pub fn build_command(game: &Game, runner: &Runner) -> Result<Argv> {
+    let (bin, args, env) = runner_command(game, runner)?;
+    match sandbox_plan(game, runner) {
+        Some(plan) => Ok((sandbox::bwrap()?, plan.wrap(&bin, &args, &env)?, Vec::new())),
+        None => Ok((bin, args, env)),
+    }
+}
+
+/// What a sandboxed game may see, or None when its sandbox is off.
+pub fn sandbox_plan(game: &Game, runner: &Runner) -> Option<Plan> {
+    if !game.sandbox.enabled {
+        return None;
+    }
+    let prefix = match runner.kind {
+        RunnerKind::Proton => game.compat_data_path().join("pfx"),
+        RunnerKind::Wine => game.prefix.clone(),
+    };
+    let mut plan = Plan::new(&game.root_dir(), &prefix, runner, &game.sandbox, &game.cwd());
+    // The game's files do not always sit beside its prefix.
+    for dir in [game.prefix.clone(), game.compat_data_path(), game.exe_dir(), game.cwd()] {
+        if !dir.as_os_str().is_empty() && !dir.starts_with(&plan.root) {
+            plan.read_write.push(dir);
+        }
+    }
+    // stdout and stderr are this file, and wine asks for their names at
+    // startup: a path that does not exist inside makes proton's ntdll crash.
+    plan.read_write.push(library::log_dir().join(format!("{}.log", game.id)));
+    plan.gamescope = game.gamescope.enabled;
+    Some(plan)
+}
+
+/// The runner invocation itself, before any sandbox goes around it.
+fn runner_command(game: &Game, runner: &Runner) -> Result<Argv> {
     let exe = game
         .exe
         .to_str()
@@ -107,23 +146,36 @@ pub fn build_command(game: &Game, runner: &Runner) -> Result<(PathBuf, Vec<Strin
     Ok((runner.bin.clone(), args, env))
 }
 
-/// Render the command as a copy-pasteable shell line.
+/// Render the command for the detail pane. A sandboxed one is summarised:
+/// the full bwrap line runs to dozens of arguments and would bury the rest.
 pub fn command_preview(game: &Game, runner: &Runner) -> String {
+    let built = build_command(game, runner).and_then(|_| runner_command(game, runner));
+    match (built, sandbox_plan(game, runner)) {
+        (Ok(argv), Some(plan)) => format!("{} {}", plan.describe(), shell_line(&argv)),
+        (Ok(argv), None) => shell_line(&argv),
+        (Err(e), _) => format!("(cannot launch: {})", e),
+    }
+}
+
+/// The whole command, copy-pasteable, for the log header.
+pub fn command_line(game: &Game, runner: &Runner) -> String {
     match build_command(game, runner) {
-        Ok((bin, args, env)) => {
-            let mut s = String::new();
-            for (k, v) in env {
-                s.push_str(&format!("{}={} ", k, shell_quote(&v)));
-            }
-            s.push_str(&shell_quote(&bin.to_string_lossy()));
-            for a in args {
-                s.push(' ');
-                s.push_str(&shell_quote(&a));
-            }
-            s
-        }
+        Ok(argv) => shell_line(&argv),
         Err(e) => format!("(cannot launch: {})", e),
     }
+}
+
+pub fn shell_line((bin, args, env): &Argv) -> String {
+    let mut s = String::new();
+    for (k, v) in env {
+        s.push_str(&format!("{}={} ", k, shell_quote(v)));
+    }
+    s.push_str(&shell_quote(&bin.to_string_lossy()));
+    for a in args {
+        s.push(' ');
+        s.push_str(&shell_quote(a));
+    }
+    s
 }
 
 fn shell_quote(s: &str) -> String {
@@ -151,6 +203,10 @@ pub fn launch(game: &Game, runner: &Runner) -> Result<Session> {
         return Err(anyhow!("executable is missing: {}", game.exe.display()));
     }
     let (bin, args, env) = build_command(game, runner)?;
+    let plan = sandbox_plan(game, runner);
+    if let Some(plan) = &plan {
+        plan.prepare()?;
+    }
 
     fs::create_dir_all(library::log_dir())?;
     let log_path = library::log_dir().join(format!("{}.log", game.id));
@@ -159,22 +215,22 @@ pub fn launch(game: &Game, runner: &Runner) -> Result<Session> {
         use std::io::Write;
         writeln!(log, "# game-box session {}", Utc::now().to_rfc3339())?;
         writeln!(log, "# runner {} ({})", runner.name, runner.kind.label())?;
-        writeln!(log, "# {}", command_preview(game, runner))?;
+        writeln!(log, "# {}", command_line(game, runner))?;
         writeln!(log)?;
     }
     let err_log = log.try_clone()?;
 
     // Own process group, so we can signal the whole wine tree later and so
     // ^C in the TUI never reaches the game.
-    let child = Command::new(&bin)
-        .args(&args)
+    let mut cmd = Command::new(&bin);
+    cmd.args(&args)
         .envs(env)
-        .process_group(0)
         .current_dir(game.cwd())
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
-        .stderr(Stdio::from(err_log))
-        .spawn()?;
+        .stderr(Stdio::from(err_log));
+    detach(&mut cmd, plan.is_some());
+    let child = cmd.spawn()?;
 
     let prefix = match runner.kind {
         RunnerKind::Proton => game.compat_data_path().join("pfx"),
@@ -190,8 +246,28 @@ pub fn launch(game: &Game, runner: &Runner) -> Result<Session> {
         runner: runner.name.clone(),
         prefix,
         wineserver: crate::runners::wineserver_for(runner),
+        sandboxed: plan.is_some(),
         kill_requested: false,
     })
+}
+
+/// Put a child in a process group of its own. A sandboxed one gets a whole
+/// session instead, which leaves it without a controlling terminal: through
+/// `/dev/tty` it could otherwise push keystrokes into the shell behind the
+/// TUI. The session id doubles as the group id, so signalling is unchanged.
+pub fn detach(cmd: &mut Command, sandboxed: bool) {
+    if sandboxed {
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc_setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    } else {
+        cmd.process_group(0);
+    }
 }
 
 /// Ask a running session to quit. The first call is polite; a second one goes
@@ -207,6 +283,14 @@ pub fn terminate(session: &mut Session) -> &'static str {
         return "asked the game to quit — press x again to force the prefix down";
     }
     match &session.wineserver {
+        // The sandbox's pid 1 is in our group; killing it takes every process
+        // in the namespace — wineserver included — down with it.
+        _ if session.sandboxed => {
+            unsafe {
+                libc_kill(-(session.pid as i32), 9);
+            }
+            "killing everything in the sandbox"
+        }
         Some(ws) => {
             crate::runners::kill_prefix(ws, &session.prefix);
             "killing every process in the prefix"
@@ -224,4 +308,6 @@ pub fn terminate(session: &mut Session) -> &'static str {
 extern "C" {
     #[link_name = "kill"]
     fn libc_kill(pid: i32, sig: i32) -> i32;
+    #[link_name = "setsid"]
+    fn libc_setsid() -> i32;
 }

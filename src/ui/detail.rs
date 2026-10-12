@@ -147,6 +147,16 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(game.gamescope.summary(), gs_style),
     ]));
 
+    let sb_style = if game.sandbox.enabled {
+        Style::default().fg(theme::GOOD)
+    } else {
+        Style::default().fg(theme::DIM)
+    };
+    lines.push(Line::from(vec![
+        Span::styled(format!(" {:<11}", "sandbox"), Style::default().fg(theme::DIM)),
+        Span::styled(game.sandbox.summary(), sb_style),
+    ]));
+
     if !game.args.is_empty() {
         lines.push(field("args", join_args(&game.args)));
     }
