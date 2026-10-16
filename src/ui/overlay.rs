@@ -81,6 +81,7 @@ fn help(frame: &mut Frame, area: Rect, scroll: u16) {
     row(&mut lines, "R", "change the wine/proton runner");
     row(&mut lines, "e", "change which executable a game launches");
     row(&mut lines, "w", "gamescope settings for this game");
+    row(&mut lines, "W", "gamescope defaults for newly added games");
     row(&mut lines, "Z", "sandbox: what the game can see, network on/off");
     row(&mut lines, "A", "arguments passed to the game itself");
     row(&mut lines, "C", "open winecfg on the prefix");
@@ -104,6 +105,7 @@ fn help(frame: &mut Frame, area: Rect, scroll: u16) {
     row(&mut lines, ":log", "launch log");
     row(&mut lines, ":winecfg", "winecfg on the prefix");
     row(&mut lines, ":gamescope", "gamescope settings (also :gs)");
+    row(&mut lines, ":gs defaults", "gamescope defaults for new games");
     row(&mut lines, ":sandbox", "sandbox settings (also :sb)");
     row(&mut lines, ":args [a b]", "set launch arguments, or open the editor");
     row(&mut lines, ":exe", "change the executable");
@@ -281,6 +283,12 @@ fn gamescope(frame: &mut Frame, app: &App, area: Rect, f: &GsForm) {
         format!("  {}", f.focused().help()),
         Style::default().fg(theme::DIM),
     )));
+    if f.game_id.is_none() {
+        lines.push(Line::from(Span::styled(
+            "  games added from now on start with these; each can then change its own",
+            Style::default().fg(theme::DIM),
+        )));
+    }
 
     if crate::runners::which("gamescope").is_none() {
         lines.push(Line::from(Span::styled(
@@ -1536,7 +1544,7 @@ fn step_confirm(frame: &mut Frame, area: Rect, app: &App, w: &AddWizard) {
             working_dir: None,
             tags: Vec::new(),
             notes: String::new(),
-            gamescope: Gamescope::default(),
+            gamescope: app.lib.defaults.gamescope.clone(),
             sandbox: if w.sandbox { Sandbox::on() } else { Sandbox::default() },
             added: chrono::Utc::now(),
             last_played: None,

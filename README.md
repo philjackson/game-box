@@ -88,6 +88,10 @@ carry a `g` flag in the index. Enabling it without gamescope on `$PATH` is
 allowed but says so, and the launch fails with a clear message rather than
 silently running without it.
 
+`W` (or `:gs defaults`) opens the same editor for the library's defaults. Every
+game added after that starts with a copy of them, and its own `w` settings can
+then differ. Changing the defaults leaves games already in the library alone.
+
 ## Sandbox
 
 wine is not a security boundary: `Z:` is `/`, and Windows code can call Linux
@@ -138,7 +142,7 @@ Things to know:
 ## Keys
 
 `j`/`k` move · `Enter` play · `x` kill · `a` add · `i` install · `R` runner ·
-`e` executable · `w` gamescope · `Z` sandbox · `C` winecfg ·
+`e` executable · `w` gamescope · `W` gamescope defaults · `Z` sandbox · `C` winecfg ·
 `o` log · `d` remove · `/` search · `s` sort · `b`/`v` panes · `:` command ·
 `?` full help · `q` quit.
 

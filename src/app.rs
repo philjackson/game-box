@@ -309,7 +309,8 @@ impl AddWizard {
 /// resolution never has to round-trip through the config.
 #[derive(Debug)]
 pub struct GsForm {
-    pub game_id: String,
+    /// None edits the library's defaults for new games rather than a game.
+    pub game_id: Option<String>,
     pub game_name: String,
     pub enabled: bool,
     pub output: Prompt,
@@ -382,10 +383,17 @@ impl GsField {
 
 impl GsForm {
     pub fn new(game: &Game) -> GsForm {
-        let gs = &game.gamescope;
+        GsForm::editing(Some(game.id.clone()), game.name.clone(), &game.gamescope)
+    }
+
+    pub fn defaults(gs: &Gamescope) -> GsForm {
+        GsForm::editing(None, "defaults for new games".into(), gs)
+    }
+
+    fn editing(game_id: Option<String>, game_name: String, gs: &Gamescope) -> GsForm {
         GsForm {
-            game_id: game.id.clone(),
-            game_name: game.name.clone(),
+            game_id,
+            game_name,
             enabled: gs.enabled,
             output: Prompt::new("", &format_resolution(gs.output)),
             game_res: Prompt::new("", &format_resolution(gs.game)),
@@ -1210,7 +1218,7 @@ impl App {
             working_dir: None,
             tags: Vec::new(),
             notes: String::new(),
-            gamescope: Gamescope::default(),
+            gamescope: self.lib.defaults.gamescope.clone(),
             sandbox,
             added: Utc::now(),
             last_played: None,
@@ -1303,6 +1311,7 @@ impl App {
             KeyCode::Char('x') | KeyCode::Char('K') => self.kill_selected(),
             KeyCode::Char('o') => self.open_log(),
             KeyCode::Char('w') => self.open_gamescope(),
+            KeyCode::Char('W') => self.open_gamescope_defaults(),
             KeyCode::Char('Z') => self.open_sandbox(),
             KeyCode::Char('A') => self.open_args(),
             KeyCode::Char('e') => self.open_exe_pick(),
@@ -1488,6 +1497,7 @@ impl App {
             "kill" | "stop" => self.kill_selected(),
             "log" => self.open_log(),
             "winecfg" => self.run_winecfg(),
+            "gs" | "gamescope" if rest == "defaults" => self.open_gamescope_defaults(),
             "gs" | "gamescope" => self.open_gamescope(),
             "sb" | "sandbox" => self.open_sandbox(),
             "args" => {
@@ -2032,12 +2042,21 @@ impl App {
             KeyCode::Esc => return, // discard the edits
             KeyCode::Enter => match f.build() {
                 Ok(cfg) => {
-                    let (id, name, summary) = (f.game_id.clone(), f.game_name.clone(), cfg.summary());
-                    if let Some(g) = self.game_mut(&id) {
-                        g.gamescope = cfg;
+                    let summary = cfg.summary();
+                    match &f.game_id {
+                        Some(id) => {
+                            if let Some(g) = self.game_mut(id) {
+                                g.gamescope = cfg;
+                            }
+                            let _ = self.lib.save();
+                            self.note(format!("{}: gamescope {}", f.game_name, summary));
+                        }
+                        None => {
+                            self.lib.defaults.gamescope = cfg;
+                            let _ = self.lib.save();
+                            self.note(format!("new games start with gamescope {}", summary));
+                        }
                     }
-                    let _ = self.lib.save();
-                    self.note(format!("{}: gamescope {}", name, summary));
                     return;
                 }
                 Err(e) => f.error = Some(e),
@@ -2115,6 +2134,11 @@ impl App {
         if runners::which("gamescope").is_none() {
             self.fail("gamescope is not on $PATH — settings will be saved but cannot run");
         }
+        self.mode = Mode::Overlay(Overlay::Gamescope(Box::new(form)));
+    }
+
+    fn open_gamescope_defaults(&mut self) {
+        let form = GsForm::defaults(&self.lib.defaults.gamescope);
         self.mode = Mode::Overlay(Overlay::Gamescope(Box::new(form)));
     }
 
